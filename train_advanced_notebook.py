@@ -48,18 +48,21 @@ if INSTALL_PACKAGES:
 # 这里把所有“竞赛硬约束”显式写进配置，避免训练流程偏离提交规则。
 
 # %%
+import ast
 import gc
 import hashlib
 import importlib.util
 import io
 import json
 import math
+import operator
 import random
 import re
 import shutil
 import textwrap
 import zipfile
 from collections import Counter
+from fractions import Fraction
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -161,6 +164,14 @@ class CFG:
         "T4_numeric_specialized",
         "T5_text_specialized",
     )
+    template_router_top_k: int = 3
+    test_time_router_top_k: int = 3
+    fallback_template_id: str = "T2_compact"
+    pseudolabel_min_confidence: float = 0.85
+    pseudolabel_source_loss_weight: float = 0.4
+    hard_mining_bottom_family_k: int = 3
+    hard_mining_bottom_answer_type_k: int = 2
+    hard_mining_bottom_bucket_k: int = 2
     template_ablation_after_stage1_rows: int = 128
     template_ablation_stage2_min_gain: float = 0.02
     template_ablation_family_min_rows: int = 10
@@ -384,7 +395,7 @@ def infer_template_group(prompt: str) -> str:
     return normalized_template_fingerprint(prompt)
 
 
-def infer_answer_type(answer: str) -> str:
+def infer_answer_shape_from_gold(answer: str) -> str:
     answer = str(answer).strip()
     if BINARY_RE.fullmatch(answer):
         return "binary"
@@ -394,11 +405,28 @@ def infer_answer_type(answer: str) -> str:
         return "multi_token_text"
     return "short_text"
 
+
+def infer_expected_answer_type_from_prompt(prompt: str) -> str:
+    text = normalize_whitespace(prompt).lower()
+    binary_keywords = ["bit", "binary", "xor", "0/1", "flip", "bits", "ones", "zeros"]
+    numeric_keywords = ["number", "digit", "value", "compute", "sequence", "matrix", "sum", "count", "next number"]
+    text_keywords = ["word", "text", "string", "cipher", "decode", "decrypt", "letters", "phrase"]
+
+    if any(keyword in text for keyword in binary_keywords):
+        return "binary"
+    if any(keyword in text for keyword in numeric_keywords):
+        return "numeric"
+    if any(keyword in text for keyword in text_keywords):
+        return "short_text"
+    return "short_text"
+
 full_train_df["prompt_norm"] = full_train_df["prompt"].map(normalize_whitespace)
 full_train_df["answer_norm"] = full_train_df["answer"].astype(str).str.strip()
 full_train_df["prompt_family"] = full_train_df["prompt"].map(infer_prompt_family)
 full_train_df["template_group"] = full_train_df["prompt"].map(infer_template_group)
-full_train_df["answer_type"] = full_train_df["answer"].map(infer_answer_type)
+full_train_df["answer_shape"] = full_train_df["answer"].map(infer_answer_shape_from_gold)
+full_train_df["expected_answer_type"] = full_train_df["prompt"].map(infer_expected_answer_type_from_prompt)
+full_train_df["answer_type"] = full_train_df["answer_shape"]
 full_train_df["prompt_chars"] = full_train_df["prompt"].str.len()
 full_train_df["answer_chars"] = full_train_df["answer_norm"].str.len()
 full_train_df["example_len_bucket"] = pd.cut(
@@ -455,25 +483,112 @@ FINAL_ANSWER_PATTERNS = [
     re.compile(r"final answer\s*[:：]\s*(.+)$", re.IGNORECASE | re.MULTILINE),
     re.compile(r"answer\s*[:：]\s*(.+)$", re.IGNORECASE | re.MULTILINE),
     re.compile(r"therefore[, ]+the answer is\s*(.+)$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"the answer is\s+(.+)$", re.IGNORECASE | re.MULTILINE),
 ]
+LATEX_WRAPPER_RE = re.compile(r"^(?:\\text\{(.+)\}|\\mathrm\{(.+)\}|\\left\((.+)\\right\))$")
+SAFE_EVAL_BIN_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.Pow: operator.pow,
+}
+SAFE_EVAL_UNARY_OPS = {
+    ast.UAdd: operator.pos,
+    ast.USub: operator.neg,
+}
+
+
+def normalize_whitespace(text: Any) -> str:
+    return re.sub(r"\s+", " ", str(text)).strip()
+
+
+def strip_latex_wrappers(ans: str) -> str:
+    prev = None
+    cur = ans.strip()
+    while prev != cur:
+        prev = cur
+        match = LATEX_WRAPPER_RE.match(cur)
+        if not match:
+            break
+        cur = next(group for group in match.groups() if group is not None).strip()
+    return cur
+
+
+def safe_numeric_eval(expr: str) -> Optional[float]:
+    expr = expr.strip()
+    if not expr:
+        return None
+    expr = expr.replace('^', '**')
+    expr = expr.replace('{', '(').replace('}', ')')
+    expr = re.sub(r"\\frac\s*\(([^()]+)\)\s*\(([^()]+)\)", r"(\1)/(\2)", expr)
+    expr = re.sub(r"\\frac\s*\{([^{}]+)\}\s*\{([^{}]+)\}", r"(\1)/(\2)", expr)
+    expr = re.sub(r"\\sqrt\s*\{([^{}]+)\}", r"math.sqrt(\1)", expr)
+    expr = re.sub(r"\s+", "", expr)
+
+    def _eval(node):
+        if isinstance(node, ast.Expression):
+            return _eval(node.body)
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, (int, float)):
+                return float(node.value)
+            raise ValueError('bad constant')
+        if isinstance(node, ast.Num):
+            return float(node.n)
+        if isinstance(node, ast.BinOp) and type(node.op) in SAFE_EVAL_BIN_OPS:
+            return SAFE_EVAL_BIN_OPS[type(node.op)](_eval(node.left), _eval(node.right))
+        if isinstance(node, ast.UnaryOp) and type(node.op) in SAFE_EVAL_UNARY_OPS:
+            return SAFE_EVAL_UNARY_OPS[type(node.op)](_eval(node.operand))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if isinstance(node.func.value, ast.Name) and node.func.value.id == 'math' and node.func.attr == 'sqrt' and len(node.args) == 1:
+                return math.sqrt(_eval(node.args[0]))
+        raise ValueError('unsupported expression')
+
+    try:
+        parsed = ast.parse(expr, mode='eval')
+        return float(_eval(parsed))
+    except Exception:
+        return None
 
 
 def canonicalize_answer(ans: Any) -> str:
     ans = str(ans).strip()
-    ans = ans.replace("，", ",")
-    if ans.startswith("$") and ans.endswith("$"):
-        ans = ans[1:-1].strip()
-    if ANSWER_NUMBER_RE.fullmatch(ans.replace(",", "")):
-        numeric = float(ans.replace(",", ""))
+    ans = ans.replace('，', ',')
+    ans = ans.rstrip('.。;； ')
+    ans = re.sub(r'^[$`]+|[$`]+$', '', ans).strip()
+    ans = re.sub(r'^\s*(?:final answer|answer)\s*[:：-]\s*', '', ans, flags=re.IGNORECASE)
+    ans = strip_latex_wrappers(ans)
+
+    if ans.startswith('\\boxed{') and ans.endswith('}'):
+        ans = ans[len('\\boxed{'):-1].strip()
+
+    numeric_candidate = ans.replace(',', '')
+    if ANSWER_NUMBER_RE.fullmatch(numeric_candidate):
+        numeric = float(numeric_candidate)
         if numeric.is_integer():
             return str(int(numeric))
-        return format(numeric, ".12g")
+        return format(numeric, '.12g')
+
+    fraction_candidate = ans.replace(' ', '')
+    if re.fullmatch(r'[-+]?\d+/\d+', fraction_candidate):
+        try:
+            frac = Fraction(fraction_candidate)
+            return str(frac.numerator) if frac.denominator == 1 else f"{frac.numerator}/{frac.denominator}"
+        except Exception:
+            pass
+
+    evaluated = safe_numeric_eval(ans)
+    if evaluated is not None and math.isfinite(evaluated):
+        if float(evaluated).is_integer():
+            return str(int(evaluated))
+        return format(float(evaluated), '.12g')
+
     return normalize_whitespace(ans)
 
 
 def boxed(ans: Any) -> str:
     clean = canonicalize_answer(ans)
-    return clean if clean.startswith("\\boxed{") else f"\\boxed{{{clean}}}"
+    return clean if clean.startswith('\\boxed{') else f"\\boxed{{{clean}}}"
 
 
 def extract_boxed(text: str) -> Optional[str]:
@@ -491,9 +606,9 @@ def extract_final_answer_pattern(text: str) -> Optional[str]:
         hits = pattern.findall(text)
         if hits:
             candidate = normalize_whitespace(hits[-1])
-            candidate = candidate.rstrip(".。 ")
-            candidate = re.sub(r"^\$|\$$", "", candidate)
-            candidate = re.sub(r"^[=:：-]\s*", "", candidate)
+            candidate = candidate.rstrip('.。 ')
+            candidate = re.sub(r'^[$`]+|[$`]+$', '', candidate)
+            candidate = re.sub(r'^[=:：-]\s*', '', candidate)
             if candidate:
                 return canonicalize_answer(candidate)
     return None
@@ -503,18 +618,17 @@ def extract_other_heuristics(text: str) -> Optional[str]:
     text = str(text).strip()
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if lines:
-        last_line = re.sub(r"^\$|\$$", "", lines[-1]).strip()
-        if last_line:
-            if LAST_NUMBER_RE.fullmatch(last_line.replace(",", "")):
-                return canonicalize_answer(last_line)
-            if len(last_line) <= 128:
-                return canonicalize_answer(last_line)
+        short_lines = [line for line in lines[-3:] if len(line) <= 128]
+        for line in reversed(short_lines):
+            candidate = re.sub(r'^[$`]+|[$`]+$', '', line).strip()
+            if candidate:
+                return canonicalize_answer(candidate)
     return None
 
 
 def extract_last_numeric(text: str) -> Optional[str]:
     text = str(text).strip()
-    last_num_hits = LAST_NUMBER_RE.findall(text.replace(",", ""))
+    last_num_hits = LAST_NUMBER_RE.findall(text.replace(',', ''))
     if last_num_hits:
         return canonicalize_answer(last_num_hits[-1])
     return None
@@ -599,6 +713,7 @@ def approx_equal(pred: str, gold: str, rel_tol: float = cfg.numeric_rel_tol) -> 
             return abs(p - g) <= rel_tol
         return abs(p - g) / max(abs(g), 1e-12) <= rel_tol
     return False
+
 
 # %% [markdown]
 # ## Cell 8 — Prompt 模板工程
@@ -708,6 +823,19 @@ FAMILY_TEMPLATE_PRIORS: Dict[str, str] = {
     "open_template": "T5_text_specialized",
 }
 BEST_TEMPLATE_BY_FAMILY: Dict[str, str] = dict(FAMILY_TEMPLATE_PRIORS)
+FAMILY_TEMPLATE_ROUTER: Dict[str, List[str]] = {
+    "bit_transform": ["T4_numeric_specialized", "T1_ultra_compact", "T3_hidden_reasoning"],
+    "cipher_decrypt": ["T5_text_specialized", "T3_hidden_reasoning", "T1_ultra_compact"],
+    "fewshot_pattern": ["T3_hidden_reasoning", "T1_ultra_compact", "T4_numeric_specialized"],
+    "matrix_reasoning": ["T3_hidden_reasoning", "T4_numeric_specialized", "T1_ultra_compact"],
+    "sequence": ["T3_hidden_reasoning", "T1_ultra_compact", "T4_numeric_specialized"],
+    "open_template": ["T5_text_specialized", "T1_ultra_compact", "T3_hidden_reasoning"],
+    "default": ["T1_ultra_compact", "T3_hidden_reasoning", "T4_numeric_specialized"],
+}
+BEST_TEMPLATE_ROUTER_BY_FAMILY: Dict[str, List[str]] = {
+    family: list(router) for family, router in FAMILY_TEMPLATE_ROUTER.items()
+}
+CURRENT_WEAK_FAMILIES: List[str] = []
 
 
 def choose_template_id(answer_type: str, prompt_family: str) -> str:
@@ -725,6 +853,37 @@ def choose_template_id(answer_type: str, prompt_family: str) -> str:
 def choose_template(problem: str, answer_type: str, prompt_family: str) -> Tuple[str, str]:
     template_id = choose_template_id(answer_type, prompt_family)
     return template_id, TEMPLATE_POOL[template_id](problem)
+
+
+def router_get_templates(prompt_family: str, answer_type: Optional[str] = None, top_k: Optional[int] = None) -> List[str]:
+    base_router = BEST_TEMPLATE_ROUTER_BY_FAMILY.get(
+        prompt_family,
+        BEST_TEMPLATE_ROUTER_BY_FAMILY.get("default", list(cfg.test_time_template_candidates)),
+    )
+    candidates = list(base_router)
+    if answer_type in {"numeric", "binary"}:
+        preferred = ["T4_numeric_specialized", "T1_ultra_compact", "T3_hidden_reasoning"]
+        candidates = preferred + candidates
+    elif answer_type in {"short_text", "multi_token_text"} or prompt_family in {"cipher_decrypt", "open_template"}:
+        preferred = ["T5_text_specialized", "T1_ultra_compact", "T3_hidden_reasoning"]
+        candidates = preferred + candidates
+    else:
+        candidates = ["T1_ultra_compact", "T3_hidden_reasoning"] + candidates
+
+    deduped: List[str] = []
+    for template_id in candidates:
+        if template_id in TEMPLATE_POOL and template_id not in deduped:
+            deduped.append(template_id)
+    keep = top_k if top_k is not None else cfg.test_time_router_top_k
+    return deduped[: max(1, keep)]
+
+
+def get_weak_families_from_pred_df(pred_df: pd.DataFrame, top_k: Optional[int] = None) -> List[str]:
+    if pred_df is None or pred_df.empty:
+        return []
+    family_acc = pred_df.groupby("prompt_family")["hit"].mean().sort_values()
+    keep = min(max(top_k or cfg.hard_mining_bottom_family_k, 1), len(family_acc))
+    return family_acc.head(keep).index.tolist()
 
 
 def build_short_reasoning_scaffold(answer: Any, answer_type: str, prompt_family: str) -> str:
@@ -783,6 +942,8 @@ def build_training_record(row: pd.Series) -> Dict[str, Any]:
         "reasoning_full_text": reasoning_full_text,
         "gold_answer": canonicalize_answer(row.answer),
         "source": row.source,
+        "source_loss_weight": float(getattr(row, "source_loss_weight", 1.0)),
+        "pseudo_confidence": float(getattr(row, "confidence", 1.0)),
         "difficulty": difficulty,
         "prompt_chars": row.prompt_chars,
         "len_bucket": str(row.example_len_bucket),
@@ -804,6 +965,8 @@ def build_records_frame(df: pd.DataFrame) -> pd.DataFrame:
                 "reasoning_full_text",
                 "gold_answer",
                 "source",
+                "source_loss_weight",
+                "pseudo_confidence",
                 "difficulty",
                 "prompt_chars",
                 "len_bucket",
@@ -1107,6 +1270,8 @@ def compute_sample_weights(
             weight *= {"xs": 0.9, "s": 1.0, "m": 1.08, "l": 1.15, "xl": 1.2}.get(row.len_bucket, 1.0)
             weight *= 1.0 / math.sqrt(bucket_counts.get(row.len_bucket, 1))
         weight *= float(row.difficulty)
+        weight *= float(getattr(row, "source_loss_weight", 1.0))
+        weight *= 0.8 + 0.2 * float(getattr(row, "pseudo_confidence", 1.0))
         if hard_profile is not None:
             weight *= 1.0 + cfg.hard_mining_family_boost * hard_profile["family"].get(row.prompt_family, 0.0)
             weight *= 1.0 + cfg.hard_mining_template_group_boost * hard_profile["template_group"].get(row.template_group, 0.0)
@@ -1222,6 +1387,7 @@ print("train replay probe subset:", train_replay_probe_df.shape)
 @torch.no_grad()
 def generate_answer_text(model: torch.nn.Module, prompt: str, max_new_tokens: int = 96) -> str:
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    input_len = inputs["input_ids"].shape[1]
     outputs = model.generate(
         **inputs,
         max_new_tokens=max_new_tokens,
@@ -1230,7 +1396,34 @@ def generate_answer_text(model: torch.nn.Module, prompt: str, max_new_tokens: in
         top_p=cfg.official_top_p,
         pad_token_id=tokenizer.eos_token_id,
     )
-    return tokenizer.decode(outputs[0], skip_special_tokens=True)
+    gen_ids = outputs[0][input_len:]
+    return tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+
+
+@torch.no_grad()
+def inspect_generation_completion_sanity(
+    model: torch.nn.Module,
+    df: pd.DataFrame,
+    rows: int = 3,
+    max_new_tokens: int = 96,
+) -> pd.DataFrame:
+    samples = []
+    for row in df.head(rows).itertuples(index=False):
+        prompt_family = infer_prompt_family(row.prompt)
+        answer_type = infer_expected_answer_type_from_prompt(row.prompt)
+        template_id, prompt = choose_template(row.prompt, answer_type, prompt_family)
+        raw = generate_answer_text(model, prompt, max_new_tokens=max_new_tokens).strip()
+        samples.append(
+            {
+                "id": row.id,
+                "template_id": template_id,
+                "prompt_prefix": prompt[:160],
+                "raw_completion": raw[:400],
+                "contains_prompt_echo": normalize_whitespace(prompt[:120]) in normalize_whitespace(raw),
+                "pred": metric_extract_prediction(raw),
+            }
+        )
+    return pd.DataFrame(samples)
 
 
 @torch.no_grad()
@@ -1243,7 +1436,7 @@ def evaluate_accuracy(
 ) -> Tuple[float, pd.DataFrame]:
     rows = []
     for row in df.itertuples(index=False):
-        answer_type = infer_answer_type(row.answer)
+        answer_type = infer_expected_answer_type_from_prompt(row.prompt)
         prompt_family = infer_prompt_family(row.prompt)
         template_id, prompt = choose_template(row.prompt, answer_type, prompt_family)
         if template_override is not None:
@@ -1255,7 +1448,7 @@ def evaluate_accuracy(
         boxed_hit = False
         boxed_parsed_success = False
         for max_new_tokens in max_new_tokens_grid:
-            raw = generate_answer_text(model, prompt, max_new_tokens=max_new_tokens)
+            raw = generate_answer_text(model, prompt, max_new_tokens=max_new_tokens).strip()
             boxed_matches = BOXED_RE.findall(raw)
             pred = extractor_fn(raw)
             if "\\boxed{" in raw:
@@ -1382,11 +1575,22 @@ def evaluate_multi_seed_views(
 
 
 def build_hard_profile(pred_df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
+    def _bottom_k_profile(series: pd.Series, bottom_k: int) -> Dict[str, float]:
+        if series.empty:
+            return {}
+        scores = (1.0 - series).sort_values(ascending=False)
+        keep = scores.head(min(max(bottom_k, 1), len(scores)))
+        return keep.to_dict()
+
+    family_error = pred_df.groupby("prompt_family")["hit"].mean()
+    template_group_error = pred_df.groupby("template_group")["hit"].mean()
+    answer_type_error = pred_df.groupby("answer_type")["hit"].mean()
+    len_bucket_error = pred_df.groupby("len_bucket")["hit"].mean()
     return {
-        "family": (1.0 - pred_df.groupby("prompt_family")["hit"].mean()).to_dict(),
-        "template_group": (1.0 - pred_df.groupby("template_group")["hit"].mean()).to_dict(),
-        "answer_type": (1.0 - pred_df.groupby("answer_type")["hit"].mean()).to_dict(),
-        "len_bucket": (1.0 - pred_df.groupby("len_bucket")["hit"].mean()).to_dict(),
+        "family": _bottom_k_profile(family_error, cfg.hard_mining_bottom_family_k),
+        "template_group": (1.0 - template_group_error).to_dict(),
+        "answer_type": _bottom_k_profile(answer_type_error, cfg.hard_mining_bottom_answer_type_k),
+        "len_bucket": _bottom_k_profile(len_bucket_error, cfg.hard_mining_bottom_bucket_k),
     }
 
 
@@ -1555,23 +1759,171 @@ def apply_template_ablation_updates(
     return pd.DataFrame(decisions).sort_values(["updated", "gain", "family_rows"], ascending=[False, False, False]).reset_index(drop=True)
 
 
-@torch.no_grad()
-def ensemble_predict(model: torch.nn.Module, prompt_text: str, template_ids: Sequence[str]) -> Dict[str, Any]:
-    votes = []
-    raw_candidates = []
-    for template_id in template_ids:
-        raw = generate_answer_text(model, TEMPLATE_POOL[template_id](prompt_text))
-        pred = metric_extract_prediction(raw)
-        votes.append(pred)
-        raw_candidates.append({"template_id": template_id, "pred": pred, "raw": raw[:800]})
+def build_family_template_router_from_mapping(
+    mapping_df: pd.DataFrame,
+    top_k: Optional[int] = None,
+) -> Dict[str, List[str]]:
+    if mapping_df is None or mapping_df.empty:
+        return {family: list(router) for family, router in FAMILY_TEMPLATE_ROUTER.items()}
 
-    vote_counter = Counter(votes)
-    best_pred, best_votes = sorted(vote_counter.items(), key=lambda x: (-x[1], x[0]))[0]
+    keep = top_k if top_k is not None else cfg.template_router_top_k
+    router_map: Dict[str, List[str]] = {}
+    for family, block in mapping_df.groupby("prompt_family", sort=True):
+        ordered = block.sort_values(
+            ["accuracy", "boxed_parse_rate", "has_boxed_rate", "family_rows"],
+            ascending=[False, False, False, False],
+        )["template_id"].tolist()
+        router_map[family] = []
+        for template_id in ordered + FAMILY_TEMPLATE_ROUTER.get(family, []) + FAMILY_TEMPLATE_ROUTER["default"]:
+            if template_id in TEMPLATE_POOL and template_id not in router_map[family]:
+                router_map[family].append(template_id)
+        router_map[family] = router_map[family][: max(1, keep)]
+
+    router_map["default"] = list(FAMILY_TEMPLATE_ROUTER["default"])[: max(1, keep)]
+    return router_map
+
+
+def is_numeric_candidate(answer: str) -> bool:
+    answer = canonicalize_answer(answer)
+    return bool(ANSWER_NUMBER_RE.fullmatch(answer.replace(",", "")) or re.fullmatch(r"[-+]?\d+/\d+", answer.replace(" ", "")))
+
+
+def infer_with_multi_templates(
+    model: torch.nn.Module,
+    example: Any,
+    template_ids: Sequence[str],
+    max_new_tokens: int = 96,
+    extractor_fn=metric_extract_prediction,
+) -> List[Dict[str, Any]]:
+    prompt_text = example.prompt if hasattr(example, "prompt") else example["prompt"]
+    candidates: List[Dict[str, Any]] = []
+    for template_id in template_ids:
+        raw = generate_answer_text(model, TEMPLATE_POOL[template_id](prompt_text), max_new_tokens=max_new_tokens).strip()
+        answer = extractor_fn(raw)
+        candidates.append(
+            {
+                "template_id": template_id,
+                "raw": raw[:1200],
+                "answer": canonicalize_answer(answer),
+                "has_boxed": "\\boxed{" in raw,
+                "boxed_answer": extract_boxed(raw),
+            }
+        )
+    return candidates
+
+
+def aggregate_candidates(
+    candidates: Sequence[Dict[str, Any]],
+    answer_type: Optional[str] = None,
+    preferred_template_ids: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
+    valid_answers = [c["answer"] for c in candidates if c.get("answer") not in [None, ""]]
+    if not valid_answers:
+        return {"pred": "", "vote_count": 0, "needs_fallback": True, "decision_type": "empty"}
+
+    answer_counts = Counter(valid_answers)
+    top_answer, top_votes = answer_counts.most_common(1)[0]
+    if top_votes >= 2:
+        return {"pred": top_answer, "vote_count": top_votes, "needs_fallback": False, "decision_type": "majority"}
+
+    if answer_type in {"numeric", "binary"}:
+        numeric_answers = [c["answer"] for c in candidates if c.get("answer") and is_numeric_candidate(c["answer"])]
+        if numeric_answers:
+            numeric_counts = Counter(numeric_answers)
+            numeric_answer, numeric_votes = numeric_counts.most_common(1)[0]
+            if numeric_votes >= 1:
+                return {
+                    "pred": numeric_answer,
+                    "vote_count": numeric_votes,
+                    "needs_fallback": numeric_votes == 1,
+                    "decision_type": "numeric_priority",
+                }
+
+    for candidate in candidates:
+        if candidate.get("boxed_answer"):
+            return {
+                "pred": canonicalize_answer(candidate["boxed_answer"]),
+                "vote_count": answer_counts.get(candidate["answer"], 1),
+                "needs_fallback": True,
+                "decision_type": "boxed_priority",
+            }
+
+    preferred = list(preferred_template_ids or ["T4_numeric_specialized", "T1_ultra_compact", "T3_hidden_reasoning", "T5_text_specialized"])
+    for template_id in preferred:
+        for candidate in candidates:
+            if candidate["template_id"] == template_id and candidate.get("answer"):
+                return {
+                    "pred": candidate["answer"],
+                    "vote_count": answer_counts.get(candidate["answer"], 1),
+                    "needs_fallback": True,
+                    "decision_type": f"preferred::{template_id}",
+                }
+
+    return {"pred": top_answer, "vote_count": top_votes, "needs_fallback": True, "decision_type": "fallback_first"}
+
+
+@torch.no_grad()
+def submission_style_predict_row(
+    model: torch.nn.Module,
+    row: Any,
+    template_ids: Optional[Sequence[str]] = None,
+    fallback_template_id: Optional[str] = None,
+    max_new_tokens_grid: Sequence[int] = (64, 96),
+    extractor_fn=metric_extract_prediction,
+) -> Dict[str, Any]:
+    prompt_text = row.prompt if hasattr(row, "prompt") else row["prompt"]
+    if hasattr(row, "answer"):
+        gold = canonicalize_answer(row.answer)
+    elif isinstance(row, dict) and "answer" in row:
+        gold = canonicalize_answer(row["answer"])
+    else:
+        gold = ""
+    prompt_family = infer_prompt_family(prompt_text)
+    answer_type = infer_expected_answer_type_from_prompt(prompt_text)
+    routed_templates = list(template_ids or router_get_templates(prompt_family, answer_type=answer_type))
+    final_candidates: List[Dict[str, Any]] = []
+    for max_new_tokens in max_new_tokens_grid:
+        final_candidates = infer_with_multi_templates(
+            model,
+            {"prompt": prompt_text},
+            template_ids=routed_templates,
+            max_new_tokens=max_new_tokens,
+            extractor_fn=extractor_fn,
+        )
+        aggregate = aggregate_candidates(final_candidates, answer_type=answer_type, preferred_template_ids=routed_templates)
+        if aggregate["decision_type"] == "majority":
+            break
+
+    aggregate = aggregate_candidates(final_candidates, answer_type=answer_type, preferred_template_ids=routed_templates)
+    fallback_used = False
+    fallback_id = fallback_template_id or cfg.fallback_template_id
+    if aggregate["needs_fallback"] and fallback_id not in routed_templates and fallback_id in TEMPLATE_POOL:
+        fallback_used = True
+        fallback_candidates = infer_with_multi_templates(
+            model,
+            {"prompt": prompt_text},
+            template_ids=[fallback_id],
+            max_new_tokens=max_new_tokens_grid[-1],
+            extractor_fn=extractor_fn,
+        )
+        final_candidates = list(final_candidates) + list(fallback_candidates)
+        aggregate = aggregate_candidates(
+            final_candidates,
+            answer_type=answer_type,
+            preferred_template_ids=[fallback_id] + routed_templates,
+        )
+
     return {
-        "pred": best_pred,
-        "votes": best_votes,
-        "num_templates": len(template_ids),
-        "candidates": raw_candidates,
+        "pred": aggregate["pred"],
+        "consensus_votes": aggregate["vote_count"],
+        "num_templates": len(final_candidates),
+        "decision_type": aggregate["decision_type"],
+        "fallback_used": fallback_used,
+        "template_ids": [c["template_id"] for c in final_candidates],
+        "candidates": final_candidates,
+        "prompt_family": prompt_family,
+        "answer_type": answer_type,
+        "gold": gold,
     }
 
 
@@ -1579,18 +1931,58 @@ def ensemble_predict(model: torch.nn.Module, prompt_text: str, template_ids: Seq
 def evaluate_with_consensus(model: torch.nn.Module, df: pd.DataFrame, template_ids: Sequence[str]) -> Tuple[float, pd.DataFrame]:
     rows = []
     for row in df.itertuples(index=False):
-        result = ensemble_predict(model, row.prompt, template_ids=template_ids)
+        result = submission_style_predict_row(model, row, template_ids=template_ids)
         gold = canonicalize_answer(row.answer)
         rows.append(
             {
                 "id": row.id,
-                "prompt_family": infer_prompt_family(row.prompt),
-                "answer_type": infer_answer_type(row.answer),
+                "prompt_family": result["prompt_family"],
+                "answer_type": result["answer_type"],
                 "gold": gold,
                 "pred": result["pred"],
                 "hit": approx_equal(result["pred"], gold),
-                "consensus_votes": result["votes"],
+                "consensus_votes": result["consensus_votes"],
                 "num_templates": result["num_templates"],
+                "decision_type": result["decision_type"],
+                "fallback_used": result["fallback_used"],
+            }
+        )
+    out = pd.DataFrame(rows)
+    return float(out["hit"].mean()) if len(out) else 0.0, out
+
+
+@torch.no_grad()
+def offline_submission_style_eval(
+    model: torch.nn.Module,
+    valid_df: pd.DataFrame,
+    top_k: Optional[int] = None,
+) -> Tuple[float, pd.DataFrame]:
+    rows = []
+    for row in valid_df.itertuples(index=False):
+        routed_templates = router_get_templates(
+            infer_prompt_family(row.prompt),
+            answer_type=infer_expected_answer_type_from_prompt(row.prompt),
+            top_k=top_k,
+        )
+        result = submission_style_predict_row(
+            model,
+            row,
+            template_ids=routed_templates,
+        )
+        gold = canonicalize_answer(row.answer)
+        rows.append(
+            {
+                "id": row.id,
+                "prompt_family": result["prompt_family"],
+                "answer_type": result["answer_type"],
+                "gold": gold,
+                "pred": result["pred"],
+                "hit": approx_equal(result["pred"], gold),
+                "template_ids": ",".join(result["template_ids"]),
+                "consensus_votes": result["consensus_votes"],
+                "num_templates": result["num_templates"],
+                "decision_type": result["decision_type"],
+                "fallback_used": result["fallback_used"],
             }
         )
     out = pd.DataFrame(rows)
@@ -1639,13 +2031,26 @@ def family_specific_verifier(prompt_family: str, prompt: str, answer: str) -> bo
 
 
 @torch.no_grad()
-def build_consensus_pseudolabels(model: torch.nn.Module, unlabeled_df: pd.DataFrame, template_ids: Sequence[str], max_rows: int = 128) -> pd.DataFrame:
+def build_consensus_pseudolabels(
+    model: torch.nn.Module,
+    unlabeled_df: pd.DataFrame,
+    template_ids: Sequence[str],
+    max_rows: int = 128,
+    weak_families: Optional[Sequence[str]] = None,
+) -> pd.DataFrame:
     rows = []
+    weak_family_set = set(weak_families or [])
     for row in unlabeled_df.head(max_rows).itertuples(index=False):
         prompt_family = infer_prompt_family(row.prompt)
-        result = ensemble_predict(model, row.prompt, template_ids=template_ids)
-        answer_type = infer_answer_type(result["pred"])
-        if result["votes"] != result["num_templates"]:
+        if weak_family_set and prompt_family not in weak_family_set:
+            continue
+        result = submission_style_predict_row(model, row, template_ids=template_ids)
+        answer_type = infer_answer_shape_from_gold(result["pred"])
+        template_vote_ratio = result["consensus_votes"] / max(result["num_templates"], 1)
+        self_consistency_ratio = 1.0 if result["decision_type"] == "majority" else template_vote_ratio
+        format_valid_score = 1.0 if any(c.get("boxed_answer") for c in result["candidates"]) else 0.5
+        confidence = template_vote_ratio * 0.5 + self_consistency_ratio * 0.3 + format_valid_score * 0.2
+        if confidence < cfg.pseudolabel_min_confidence:
             continue
         if not pseudolabel_passes_family_filter(prompt_family, answer_type, result["pred"]):
             continue
@@ -1657,9 +2062,13 @@ def build_consensus_pseudolabels(model: torch.nn.Module, unlabeled_df: pd.DataFr
                 "prompt": row.prompt,
                 "answer": result["pred"],
                 "source": f"consensus_pseudolabel::{prompt_family}",
-                "confidence": result["votes"] / result["num_templates"],
+                "confidence": confidence,
+                "template_vote_ratio": template_vote_ratio,
+                "self_consistency_ratio": self_consistency_ratio,
+                "format_valid_score": format_valid_score,
                 "prompt_family": prompt_family,
                 "answer_type": answer_type,
+                "source_loss_weight": cfg.pseudolabel_source_loss_weight,
             }
         )
     return pd.DataFrame(rows)
@@ -1669,14 +2078,16 @@ def build_consensus_pseudolabels(model: torch.nn.Module, unlabeled_df: pd.DataFr
 def summarize_template_disagreement(model: torch.nn.Module, df: pd.DataFrame, template_ids: Sequence[str], max_rows: int = 128) -> pd.DataFrame:
     rows = []
     for row in df.head(max_rows).itertuples(index=False):
-        result = ensemble_predict(model, row.prompt, template_ids=template_ids)
-        disagreement = 1.0 - (result["votes"] / result["num_templates"])
+        result = submission_style_predict_row(model, row, template_ids=template_ids)
+        disagreement = 1.0 - (result["consensus_votes"] / max(result["num_templates"], 1))
         rows.append(
             {
                 "id": row.id,
-                "prompt_family": infer_prompt_family(row.prompt),
-                "answer_type": infer_answer_type(getattr(row, "answer", "")),
+                "prompt_family": result["prompt_family"],
+                "answer_type": result["answer_type"],
                 "disagreement": disagreement,
+                "decision_type": result["decision_type"],
+                "fallback_used": result["fallback_used"],
             }
         )
     out = pd.DataFrame(rows)
@@ -1764,6 +2175,7 @@ def maybe_extend_stage2_with_pseudolabels(
         unlabeled_df,
         template_ids=cfg.consensus_template_ids,
         max_rows=cfg.consensus_pseudolabel_max_rows,
+        weak_families=CURRENT_WEAK_FAMILIES,
     )
     if pseudo_df.empty:
         print("no consensus pseudolabels were added to stage2")
@@ -1830,9 +2242,22 @@ def perform_conservative_template_refresh(
         family_template_full_df,
         secondary_mapping_df=family_template_secondary_df,
     )
+    BEST_TEMPLATE_ROUTER_BY_FAMILY.clear()
+    BEST_TEMPLATE_ROUTER_BY_FAMILY.update(
+        build_family_template_router_from_mapping(
+            family_template_full_df,
+            top_k=cfg.template_router_top_k,
+        )
+    )
     template_score_df.to_csv(Path(cfg.work_dir) / f"{prefix}_template_ablation_scores.csv", index=False)
     family_template_map_df.to_csv(Path(cfg.work_dir) / f"{prefix}_family_template_map.csv", index=False)
     family_template_full_df.to_csv(Path(cfg.work_dir) / f"{prefix}_family_template_full.csv", index=False)
+    pd.DataFrame(
+        [
+            {"prompt_family": family, "template_ids": ",".join(template_ids)}
+            for family, template_ids in sorted(BEST_TEMPLATE_ROUTER_BY_FAMILY.items())
+        ]
+    ).to_csv(Path(cfg.work_dir) / f"{prefix}_family_template_router.csv", index=False)
     template_update_decisions_df.to_csv(Path(cfg.work_dir) / f"{prefix}_family_template_update_decisions.csv", index=False)
     return template_score_df, family_template_map_df, family_template_full_df, template_update_decisions_df
 
@@ -1946,6 +2371,7 @@ def train_stage2_with_reweight(
         )
 
         hard_profile = build_hard_profile(last_pred_df)
+        CURRENT_WEAK_FAMILIES[:] = get_weak_families_from_pred_df(last_pred_df, top_k=cfg.stage2_refresh_weak_family_top_k)
         probe_acc, replay_probe_pred_df = evaluate_accuracy(model, train_replay_probe_df, extractor_fn=fast_extract_prediction)
         replay_probe_pred_df.to_csv(Path(cfg.work_dir) / f"stage2_round_{round_idx + 1}_train_probe_predictions.csv", index=False)
         replay_buffer = update_replay_buffer(replay_buffer, replay_probe_pred_df)
@@ -2106,6 +2532,13 @@ stage1_acc, stage1_pred_df, stage1_multi_seed_df = run_serious_eval_suite(
     serious_eval_views,
     prefix="stage1_valid",
 )
+stage1_submission_style_acc, stage1_submission_style_df = offline_submission_style_eval(
+    model,
+    serious_eval_df.head(min(len(serious_eval_df), 128)),
+    top_k=cfg.test_time_router_top_k,
+)
+print(f"stage1 submission-style accuracy: {stage1_submission_style_acc:.4f}")
+stage1_submission_style_df.to_csv(Path(cfg.work_dir) / "stage1_submission_style_eval.csv", index=False)
 
 stage1_train_probe_acc, stage1_train_probe_pred_df = evaluate_accuracy(
     model,
@@ -2116,6 +2549,8 @@ print(f"stage1 train replay probe accuracy: {stage1_train_probe_acc:.4f}")
 stage1_train_probe_pred_df.to_csv(Path(cfg.work_dir) / "stage1_train_probe_predictions.csv", index=False)
 replay_buffer = update_replay_buffer({}, stage1_train_probe_pred_df)
 print("bootstrapped replay buffer size:", len(replay_buffer))
+CURRENT_WEAK_FAMILIES[:] = get_weak_families_from_pred_df(stage1_pred_df, top_k=cfg.stage2_refresh_weak_family_top_k)
+print("current weak families after stage1:", CURRENT_WEAK_FAMILIES)
 
 if cfg.enable_prompt_template_ablation:
     template_eval_rows = max(cfg.reasoning_template_eval_rows, cfg.template_ablation_after_stage1_rows)
@@ -2215,6 +2650,18 @@ post_acc, post_pred_df, post_multi_seed_df = run_serious_eval_suite(
 )
 display(post_pred_df.head(10))
 
+submission_style_acc, submission_style_df = offline_submission_style_eval(
+    model,
+    serious_eval_df.head(min(len(serious_eval_df), 128)),
+    top_k=cfg.test_time_router_top_k,
+)
+print(f"post-train submission-style accuracy: {submission_style_acc:.4f}")
+display(submission_style_df.head(10))
+submission_style_df.to_csv(Path(cfg.work_dir) / "post_train_submission_style_eval.csv", index=False)
+completion_sanity_df = inspect_generation_completion_sanity(model, serious_eval_df, rows=min(len(serious_eval_df), 3))
+display(completion_sanity_df)
+completion_sanity_df.to_csv(Path(cfg.work_dir) / "post_train_generation_completion_sanity.csv", index=False)
+
 consensus_acc, consensus_df = evaluate_with_consensus(model, serious_eval_df.head(min(len(serious_eval_df), 128)), cfg.test_time_template_candidates)
 print(f"post-train consensus accuracy: {consensus_acc:.4f}")
 display(consensus_df.head(10))
@@ -2270,10 +2717,21 @@ print("zip size (MB):", round(zip_path.stat().st_size / 1024 / 1024, 3))
 smoke_df = test_df.head(5).copy()
 smoke_rows = []
 for row in smoke_df.itertuples(index=False):
-    _template_id, prompt_text = choose_template(row.prompt, "numeric", infer_prompt_family(row.prompt))
-    raw = generate_answer_text(model, prompt_text)
-    pred = metric_extract_prediction(raw)
-    smoke_rows.append({"id": row.id, "pred": pred, "raw": raw[:1000]})
+    result = submission_style_predict_row(
+        model,
+        row,
+        template_ids=router_get_templates(infer_prompt_family(row.prompt), top_k=cfg.test_time_router_top_k),
+    )
+    smoke_rows.append(
+        {
+            "id": row.id,
+            "pred": result["pred"],
+            "decision_type": result["decision_type"],
+            "fallback_used": result["fallback_used"],
+            "template_ids": ",".join(result["template_ids"]),
+            "raw": result["candidates"][0]["raw"][:1000] if result["candidates"] else "",
+        }
+    )
 smoke_pred_df = pd.DataFrame(smoke_rows)
 display(smoke_pred_df)
 smoke_pred_df.to_csv(Path(cfg.work_dir) / "smoke_predictions.csv", index=False)
