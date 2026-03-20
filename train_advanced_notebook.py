@@ -124,8 +124,9 @@ class CFG:
 
     # ===== split / eval =====
     valid_size: float = 0.08
-    approx_eval_examples: int = 96
-    numeric_rel_tol: float = 1e-4
+    fast_eval_examples: int = 96
+    serious_eval_examples: int = 256
+    numeric_rel_tol: float = 1e-2
 
     # ===== curriculum =====
     stage1_epochs: float = 0.6
@@ -162,6 +163,11 @@ class CFG:
         "gate_proj",
         "up_proj",
         "down_proj",
+    )
+    test_time_template_candidates: Tuple[str, ...] = (
+        "T1_ultra_compact",
+        "T3_hidden_reasoning",
+        "T4_numeric_specialized",
     )
 
 cfg = CFG()
@@ -383,6 +389,11 @@ print("valid template groups:", valid_fold['template_group'].nunique())
 # %%
 BOXED_RE = re.compile(r"\\boxed\{([^{}]+)\}")
 LAST_NUMBER_RE = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
+FINAL_ANSWER_PATTERNS = [
+    re.compile(r"final answer\s*[:：]\s*(.+)$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"answer\s*[:：]\s*(.+)$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"therefore[, ]+the answer is\s*(.+)$", re.IGNORECASE | re.MULTILINE),
+]
 
 
 def canonicalize_answer(ans: Any) -> str:
@@ -409,11 +420,29 @@ def extract_prediction(text: str) -> str:
     if boxed_hits:
         return canonicalize_answer(boxed_hits[-1])
 
+    for pattern in FINAL_ANSWER_PATTERNS:
+        hits = pattern.findall(text)
+        if hits:
+            candidate = normalize_whitespace(hits[-1])
+            candidate = candidate.rstrip(".。 ")
+            candidate = re.sub(r"^\$|\$$", "", candidate)
+            candidate = re.sub(r"^[=:：-]\s*", "", candidate)
+            if candidate:
+                return canonicalize_answer(candidate)
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if lines:
+        last_line = re.sub(r"^\$|\$$", "", lines[-1]).strip()
+        if last_line:
+            if LAST_NUMBER_RE.fullmatch(last_line.replace(",", "")):
+                return canonicalize_answer(last_line)
+            if len(last_line) <= 128:
+                return canonicalize_answer(last_line)
+
     last_num_hits = LAST_NUMBER_RE.findall(text.replace(",", ""))
     if last_num_hits:
         return canonicalize_answer(last_num_hits[-1])
 
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
     return canonicalize_answer(lines[-1] if lines else text)
 
 
@@ -699,7 +728,15 @@ def tokenize_answer_only(example: Dict[str, Any]) -> Dict[str, Any]:
 
 def make_supervision_frame(df: pd.DataFrame, supervision_variant: str) -> pd.DataFrame:
     tmp = df.copy()
-    tmp["supervision_variant"] = supervision_variant
+    if supervision_variant == "family_aware_mix":
+        short_reasoning_families = {"open_template", "cipher_decrypt", "matrix_reasoning"}
+        tmp["supervision_variant"] = np.where(
+            tmp["prompt_family"].isin(short_reasoning_families) | tmp["answer_type"].eq("multi_token_text"),
+            "short_reasoning",
+            "answer_only",
+        )
+    else:
+        tmp["supervision_variant"] = supervision_variant
     return tmp
 
 
@@ -731,7 +768,7 @@ def build_variant_datasets(records_df: pd.DataFrame, variant: str) -> Dataset:
 
 def build_supervision_variant_panel(records_df: pd.DataFrame) -> pd.DataFrame:
     rows = []
-    for variant in ["answer_only", "short_reasoning"]:
+    for variant in ["answer_only", "short_reasoning", "family_aware_mix"]:
         tmp = make_supervision_frame(records_df.copy(), variant)
         target_text = np.where(tmp["supervision_variant"].eq("answer_only"), tmp["full_text"], tmp["reasoning_full_text"])
         label_tokens = [
@@ -750,6 +787,7 @@ def build_supervision_variant_panel(records_df: pd.DataFrame) -> pd.DataFrame:
                 "p90_label_tokens": float(np.quantile(label_tokens, 0.9)),
                 "long_prompt_avg_label_tokens": float(tmp.loc[tmp["prompt_chars"] >= 1400, "label_tokens"].mean() if (tmp["prompt_chars"] >= 1400).any() else 0.0),
                 "numeric_avg_label_tokens": float(tmp.loc[tmp["answer_type"] == "numeric", "label_tokens"].mean() if (tmp["answer_type"] == "numeric").any() else 0.0),
+                "short_reasoning_ratio": float(tmp["supervision_variant"].eq("short_reasoning").mean()),
             }
         )
     return pd.DataFrame(rows)
@@ -757,15 +795,15 @@ def build_supervision_variant_panel(records_df: pd.DataFrame) -> pd.DataFrame:
 
 stage1_variant_ds = {
     variant: build_variant_datasets(stage1_records, variant)
-    for variant in ["answer_only", "short_reasoning"]
+    for variant in ["answer_only", "short_reasoning", "family_aware_mix"]
 }
 stage2_variant_ds = {
     variant: build_variant_datasets(stage2_records, variant)
-    for variant in ["answer_only", "short_reasoning"]
+    for variant in ["answer_only", "short_reasoning", "family_aware_mix"]
 }
 valid_variant_ds = {
     variant: build_variant_datasets(valid_records, variant)
-    for variant in ["answer_only", "short_reasoning"]
+    for variant in ["answer_only", "short_reasoning", "family_aware_mix"]
 }
 
 stage1_ds = stage1_variant_ds[cfg.primary_supervision_variant]
@@ -953,9 +991,11 @@ def build_fixed_sanity_subset(df: pd.DataFrame, max_rows: int) -> pd.DataFrame:
     return out
 
 
-valid_eval_df = stratified_valid_subset(valid_fold, cfg.approx_eval_examples)
+fast_eval_df = stratified_valid_subset(valid_fold, cfg.fast_eval_examples)
+serious_eval_df = stratified_valid_subset(valid_fold, cfg.serious_eval_examples)
 fixed_sanity_df = build_fixed_sanity_subset(valid_fold, cfg.fixed_sanity_rows)
-print("approx eval subset:", valid_eval_df.shape)
+print("fast eval subset:", fast_eval_df.shape)
+print("serious eval subset:", serious_eval_df.shape)
 print("fixed sanity subset:", fixed_sanity_df.shape)
 
 
@@ -1114,6 +1154,48 @@ def run_template_ablation(model: torch.nn.Module, df: pd.DataFrame, max_rows: in
     return score_df, best_mapping
 
 
+@torch.no_grad()
+def ensemble_predict(model: torch.nn.Module, prompt_text: str, template_ids: Sequence[str]) -> Dict[str, Any]:
+    votes = []
+    raw_candidates = []
+    for template_id in template_ids:
+        raw = generate_answer_text(model, TEMPLATE_POOL[template_id](prompt_text))
+        pred = extract_prediction(raw)
+        votes.append(pred)
+        raw_candidates.append({"template_id": template_id, "pred": pred, "raw": raw[:800]})
+
+    vote_counter = Counter(votes)
+    best_pred, best_votes = sorted(vote_counter.items(), key=lambda x: (-x[1], x[0]))[0]
+    return {
+        "pred": best_pred,
+        "votes": best_votes,
+        "num_templates": len(template_ids),
+        "candidates": raw_candidates,
+    }
+
+
+@torch.no_grad()
+def evaluate_with_consensus(model: torch.nn.Module, df: pd.DataFrame, template_ids: Sequence[str]) -> Tuple[float, pd.DataFrame]:
+    rows = []
+    for row in df.itertuples(index=False):
+        result = ensemble_predict(model, row.prompt, template_ids=template_ids)
+        gold = canonicalize_answer(row.answer)
+        rows.append(
+            {
+                "id": row.id,
+                "prompt_family": infer_prompt_family(row.prompt),
+                "answer_type": infer_answer_type(row.answer),
+                "gold": gold,
+                "pred": result["pred"],
+                "hit": approx_equal(result["pred"], gold),
+                "consensus_votes": result["votes"],
+                "num_templates": result["num_templates"],
+            }
+        )
+    out = pd.DataFrame(rows)
+    return float(out["hit"].mean()) if len(out) else 0.0, out
+
+
 class LocalAccuracyCallback(TrainerCallback):
     def __init__(self, eval_df: pd.DataFrame, save_path: str):
         self.eval_df = eval_df
@@ -1199,7 +1281,7 @@ def train_stage2_with_refresh(
         )
         trainer.train()
 
-        round_acc, last_pred_df = evaluate_accuracy(model, valid_eval_df)
+        round_acc, last_pred_df = evaluate_accuracy(model, serious_eval_df)
         print(f"stage2 round {round_idx + 1}/{cfg.stage2_rounds} approx accuracy: {round_acc:.4f}")
         print_eval_summaries(last_pred_df, prefix=f"stage2-round-{round_idx + 1}")
         last_pred_df.to_csv(Path(cfg.work_dir) / f"stage2_round_{round_idx + 1}_predictions.csv", index=False)
@@ -1222,7 +1304,7 @@ def run_supervision_variant_experiment(variant: str) -> Tuple[pd.DataFrame, Dict
     print(f"\n[supervision-ablation] variant={variant} lora_targets={exp_lora_targets}")
 
     exp_callback = LocalAccuracyCallback(
-        eval_df=valid_eval_df,
+        eval_df=fast_eval_df,
         save_path=str(Path(cfg.work_dir) / f"supervision_{variant}_local_accuracy.csv"),
     )
     exp_train_columns = ["input_ids", "attention_mask", "labels"]
@@ -1255,7 +1337,7 @@ def run_supervision_variant_experiment(variant: str) -> Tuple[pd.DataFrame, Dict
             callbacks=[exp_callback],
         )
         trainer_stage2.train()
-        _acc, variant_pred_df = evaluate_accuracy(exp_model, valid_eval_df)
+        _acc, variant_pred_df = evaluate_accuracy(exp_model, serious_eval_df)
         variant_weights = compute_sample_weights(stage2_records, hard_profile=build_hard_profile(variant_pred_df))
 
     overall_df = summarize_eval_metrics(variant_pred_df)["overall"].copy()
@@ -1316,7 +1398,7 @@ else:
 
 # %%
 local_callback = LocalAccuracyCallback(
-    eval_df=valid_eval_df,
+    eval_df=fast_eval_df,
     save_path=str(Path(cfg.work_dir) / "local_accuracy_history.csv"),
 )
 
@@ -1338,7 +1420,7 @@ else:
 # ## Cell 20 — 动态 hard mining：根据 Stage 1 错误更新采样权重
 
 # %%
-stage1_acc, stage1_pred_df = evaluate_accuracy(model, valid_eval_df)
+stage1_acc, stage1_pred_df = evaluate_accuracy(model, serious_eval_df)
 print(f"stage1 approx accuracy: {stage1_acc:.4f}")
 print_eval_summaries(stage1_pred_df, prefix="stage1-valid")
 stage1_pred_df.to_csv(Path(cfg.work_dir) / "stage1_valid_predictions.csv", index=False)
@@ -1363,11 +1445,16 @@ model, stage2_last_pred_df = train_stage2_with_refresh(
 # ## Cell 22 — 训练后本地近似评估 + 分组报表
 
 # %%
-post_acc, post_pred_df = evaluate_accuracy(model, valid_eval_df)
+post_acc, post_pred_df = evaluate_accuracy(model, serious_eval_df)
 print(f"post-train approx accuracy: {post_acc:.4f}")
 display(post_pred_df.head(10))
 print_eval_summaries(post_pred_df, prefix="post-train-valid")
 post_pred_df.to_csv(Path(cfg.work_dir) / "post_train_valid_predictions.csv", index=False)
+
+consensus_acc, consensus_df = evaluate_with_consensus(model, serious_eval_df.head(min(len(serious_eval_df), 128)), cfg.test_time_template_candidates)
+print(f"post-train consensus accuracy: {consensus_acc:.4f}")
+display(consensus_df.head(10))
+consensus_df.to_csv(Path(cfg.work_dir) / "post_train_consensus_predictions.csv", index=False)
 
 # %% [markdown]
 # ## Cell 23 — 保存 LoRA adapter，并检查 rank/配置是否合法
