@@ -395,7 +395,7 @@ def infer_template_group(prompt: str) -> str:
     return normalized_template_fingerprint(prompt)
 
 
-def infer_answer_type(answer: str) -> str:
+def infer_answer_shape_from_gold(answer: str) -> str:
     answer = str(answer).strip()
     if BINARY_RE.fullmatch(answer):
         return "binary"
@@ -405,11 +405,28 @@ def infer_answer_type(answer: str) -> str:
         return "multi_token_text"
     return "short_text"
 
+
+def infer_expected_answer_type_from_prompt(prompt: str) -> str:
+    text = normalize_whitespace(prompt).lower()
+    binary_keywords = ["bit", "binary", "xor", "0/1", "flip", "bits", "ones", "zeros"]
+    numeric_keywords = ["number", "digit", "value", "compute", "sequence", "matrix", "sum", "count", "next number"]
+    text_keywords = ["word", "text", "string", "cipher", "decode", "decrypt", "letters", "phrase"]
+
+    if any(keyword in text for keyword in binary_keywords):
+        return "binary"
+    if any(keyword in text for keyword in numeric_keywords):
+        return "numeric"
+    if any(keyword in text for keyword in text_keywords):
+        return "short_text"
+    return "short_text"
+
 full_train_df["prompt_norm"] = full_train_df["prompt"].map(normalize_whitespace)
 full_train_df["answer_norm"] = full_train_df["answer"].astype(str).str.strip()
 full_train_df["prompt_family"] = full_train_df["prompt"].map(infer_prompt_family)
 full_train_df["template_group"] = full_train_df["prompt"].map(infer_template_group)
-full_train_df["answer_type"] = full_train_df["answer"].map(infer_answer_type)
+full_train_df["answer_shape"] = full_train_df["answer"].map(infer_answer_shape_from_gold)
+full_train_df["expected_answer_type"] = full_train_df["prompt"].map(infer_expected_answer_type_from_prompt)
+full_train_df["answer_type"] = full_train_df["answer_shape"]
 full_train_df["prompt_chars"] = full_train_df["prompt"].str.len()
 full_train_df["answer_chars"] = full_train_df["answer_norm"].str.len()
 full_train_df["example_len_bucket"] = pd.cut(
@@ -1370,6 +1387,7 @@ print("train replay probe subset:", train_replay_probe_df.shape)
 @torch.no_grad()
 def generate_answer_text(model: torch.nn.Module, prompt: str, max_new_tokens: int = 96) -> str:
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    input_len = inputs["input_ids"].shape[1]
     outputs = model.generate(
         **inputs,
         max_new_tokens=max_new_tokens,
@@ -1378,7 +1396,34 @@ def generate_answer_text(model: torch.nn.Module, prompt: str, max_new_tokens: in
         top_p=cfg.official_top_p,
         pad_token_id=tokenizer.eos_token_id,
     )
-    return tokenizer.decode(outputs[0], skip_special_tokens=True)
+    gen_ids = outputs[0][input_len:]
+    return tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+
+
+@torch.no_grad()
+def inspect_generation_completion_sanity(
+    model: torch.nn.Module,
+    df: pd.DataFrame,
+    rows: int = 3,
+    max_new_tokens: int = 96,
+) -> pd.DataFrame:
+    samples = []
+    for row in df.head(rows).itertuples(index=False):
+        prompt_family = infer_prompt_family(row.prompt)
+        answer_type = infer_expected_answer_type_from_prompt(row.prompt)
+        template_id, prompt = choose_template(row.prompt, answer_type, prompt_family)
+        raw = generate_answer_text(model, prompt, max_new_tokens=max_new_tokens).strip()
+        samples.append(
+            {
+                "id": row.id,
+                "template_id": template_id,
+                "prompt_prefix": prompt[:160],
+                "raw_completion": raw[:400],
+                "contains_prompt_echo": normalize_whitespace(prompt[:120]) in normalize_whitespace(raw),
+                "pred": metric_extract_prediction(raw),
+            }
+        )
+    return pd.DataFrame(samples)
 
 
 @torch.no_grad()
@@ -1391,7 +1436,7 @@ def evaluate_accuracy(
 ) -> Tuple[float, pd.DataFrame]:
     rows = []
     for row in df.itertuples(index=False):
-        answer_type = infer_answer_type(row.answer)
+        answer_type = infer_expected_answer_type_from_prompt(row.prompt)
         prompt_family = infer_prompt_family(row.prompt)
         template_id, prompt = choose_template(row.prompt, answer_type, prompt_family)
         if template_override is not None:
@@ -1403,7 +1448,7 @@ def evaluate_accuracy(
         boxed_hit = False
         boxed_parsed_success = False
         for max_new_tokens in max_new_tokens_grid:
-            raw = generate_answer_text(model, prompt, max_new_tokens=max_new_tokens)
+            raw = generate_answer_text(model, prompt, max_new_tokens=max_new_tokens).strip()
             boxed_matches = BOXED_RE.findall(raw)
             pred = extractor_fn(raw)
             if "\\boxed{" in raw:
@@ -1753,7 +1798,7 @@ def infer_with_multi_templates(
     prompt_text = example.prompt if hasattr(example, "prompt") else example["prompt"]
     candidates: List[Dict[str, Any]] = []
     for template_id in template_ids:
-        raw = generate_answer_text(model, TEMPLATE_POOL[template_id](prompt_text), max_new_tokens=max_new_tokens)
+        raw = generate_answer_text(model, TEMPLATE_POOL[template_id](prompt_text), max_new_tokens=max_new_tokens).strip()
         answer = extractor_fn(raw)
         candidates.append(
             {
@@ -1834,7 +1879,7 @@ def submission_style_predict_row(
     else:
         gold = ""
     prompt_family = infer_prompt_family(prompt_text)
-    answer_type = infer_answer_type(gold) if gold else infer_answer_type("")
+    answer_type = infer_expected_answer_type_from_prompt(prompt_text)
     routed_templates = list(template_ids or router_get_templates(prompt_family, answer_type=answer_type))
     final_candidates: List[Dict[str, Any]] = []
     for max_new_tokens in max_new_tokens_grid:
@@ -1916,7 +1961,7 @@ def offline_submission_style_eval(
     for row in valid_df.itertuples(index=False):
         routed_templates = router_get_templates(
             infer_prompt_family(row.prompt),
-            answer_type=infer_answer_type(row.answer),
+            answer_type=infer_expected_answer_type_from_prompt(row.prompt),
             top_k=top_k,
         )
         result = submission_style_predict_row(
@@ -2000,7 +2045,7 @@ def build_consensus_pseudolabels(
         if weak_family_set and prompt_family not in weak_family_set:
             continue
         result = submission_style_predict_row(model, row, template_ids=template_ids)
-        answer_type = infer_answer_type(result["pred"])
+        answer_type = infer_answer_shape_from_gold(result["pred"])
         template_vote_ratio = result["consensus_votes"] / max(result["num_templates"], 1)
         self_consistency_ratio = 1.0 if result["decision_type"] == "majority" else template_vote_ratio
         format_valid_score = 1.0 if any(c.get("boxed_answer") for c in result["candidates"]) else 0.5
@@ -2613,6 +2658,9 @@ submission_style_acc, submission_style_df = offline_submission_style_eval(
 print(f"post-train submission-style accuracy: {submission_style_acc:.4f}")
 display(submission_style_df.head(10))
 submission_style_df.to_csv(Path(cfg.work_dir) / "post_train_submission_style_eval.csv", index=False)
+completion_sanity_df = inspect_generation_completion_sanity(model, serious_eval_df, rows=min(len(serious_eval_df), 3))
+display(completion_sanity_df)
+completion_sanity_df.to_csv(Path(cfg.work_dir) / "post_train_generation_completion_sanity.csv", index=False)
 
 consensus_acc, consensus_df = evaluate_with_consensus(model, serious_eval_df.head(min(len(serious_eval_df), 128)), cfg.test_time_template_candidates)
 print(f"post-train consensus accuracy: {consensus_acc:.4f}")
