@@ -54,10 +54,10 @@
    - Stage 1 后再跑 family-balanced template ablation。
    - 模板切换需要同时满足 gain / min_rows / boxed metrics / secondary view 稳定性。
    - 一旦更新 `BEST_TEMPLATE_BY_FAMILY`，立即重建 `train_records / valid_records / stage2 datasets`。
-   - 这里也会接入 sample-level replay bootstrap 与 consensus pseudolabel refresh。
+   - 这里也会接入 sample-level replay bootstrap 与 consensus+verifier pseudolabel refresh。
 21. **Cell 21: Stage 2 多轮重加权训练**
    - 每轮 eval 后，按 group hard profile + sample replay buffer 联合刷新采样权重。
-   - 额外支持低频率轮间资产刷新（模板 map / pseudolabel / stage2 dataset），不必每轮都重建。
+   - 额外支持低频率轮间资产刷新（模板 map / pseudolabel / stage2 dataset），并可由弱 family 停滞或 replay 过度集中触发。
 22. **Cell 22: 分组近似评估**
    - 增加 test-time template consensus 对照。
    - 把 consensus 更多当成伪标签/脆弱 family 发现工具，而不是最终提交流程本身。
@@ -77,7 +77,7 @@
 - **更贴合评分方式**：训练目标直接对齐 boxed final answer，而不是泛化不清的长文本输出。
 - **更贴合真实泛化**：显式规则 + 模板指纹分组，比纯手工 family split 更稳。
 - **更利于冲榜迭代**：外挂数据、A/B supervision、template pool、动态错题驱动重加权、stage curriculum 都有现成扩展位。
-- **更利于数据增益**：external/synthetic mixture 与带 verifier 的 consensus pseudolabel refresh 已经接入主训练路径。
+- **更利于数据增益**：external/synthetic mixture 与带 family-specific verifier 的 consensus pseudolabel refresh 已经接入主训练路径。
 - **更利于离线判断**：fast eval 看趋势，serious eval 做最终方案选择，并优先尝试挂载官方评测后端。
 - **更利于路线判断**：可以先用小规模对照实验判断 supervision 该走 `answer_only` 还是 `short_reasoning`。
 - **更利于公开复现**：每个 cell 都有清晰职责，方便你做 Kaggle write-up 和公开 Notebook 注释。

@@ -166,8 +166,14 @@ class CFG:
     template_ablation_family_min_rows: int = 10
     template_ablation_require_non_worse_boxed_metrics: bool = True
     template_ablation_secondary_seed: int = 97
+    template_ablation_secondary_max_drop: float = 0.01
+    template_ablation_strong_family_accuracy: float = 0.85
+    template_ablation_strong_family_min_gain: float = 0.04
     stage2_asset_refresh_interval_rounds: int = 2
     stage2_refresh_template_eval_rows: int = 96
+    stage2_refresh_weak_family_top_k: int = 3
+    stage2_refresh_min_weak_family_gain: float = 0.005
+    stage2_refresh_replay_family_error_threshold: float = 0.40
     fixed_sanity_rows: int = 64
     stage1_family_frequency_quantile: float = 0.55
     hard_mining_family_boost: float = 0.35
@@ -1496,6 +1502,9 @@ def apply_template_ablation_updates(
         old_metrics = lookup_template_family_metrics(full_mapping_df, family, old_template)
         new_metrics = lookup_template_family_metrics(full_mapping_df, family, new_template)
         gain = new_metrics["accuracy"] - old_metrics["accuracy"]
+        required_gain = cfg.template_ablation_stage2_min_gain
+        if old_metrics["accuracy"] >= cfg.template_ablation_strong_family_accuracy:
+            required_gain = max(required_gain, cfg.template_ablation_strong_family_min_gain)
         boxed_ok = (
             not cfg.template_ablation_require_non_worse_boxed_metrics
             or (
@@ -1506,10 +1515,11 @@ def apply_template_ablation_updates(
 
         secondary_old_metrics = lookup_template_family_metrics(secondary_mapping_df, family, old_template) if secondary_mapping_df is not None else old_metrics
         secondary_new_metrics = lookup_template_family_metrics(secondary_mapping_df, family, new_template) if secondary_mapping_df is not None else new_metrics
-        passed_multi_view_check = secondary_new_metrics["accuracy"] >= secondary_old_metrics["accuracy"]
+        secondary_gain = secondary_new_metrics["accuracy"] - secondary_old_metrics["accuracy"]
+        passed_multi_view_check = secondary_gain >= -cfg.template_ablation_secondary_max_drop
         should_update = (
             family_rows >= cfg.template_ablation_family_min_rows
-            and gain >= cfg.template_ablation_stage2_min_gain
+            and gain >= required_gain
             and boxed_ok
             and passed_multi_view_check
         )
@@ -1528,8 +1538,10 @@ def apply_template_ablation_updates(
                 "candidate_has_boxed_rate": new_metrics["has_boxed_rate"],
                 "candidate_boxed_parse_rate": new_metrics["boxed_parse_rate"],
                 "gain": gain,
+                "required_gain": required_gain,
                 "secondary_old_accuracy": secondary_old_metrics["accuracy"],
                 "secondary_candidate_accuracy": secondary_new_metrics["accuracy"],
+                "secondary_gain": secondary_gain,
                 "boxed_ok": boxed_ok,
                 "passed_multi_view_check": passed_multi_view_check,
                 "min_gain": cfg.template_ablation_stage2_min_gain,
@@ -1602,6 +1614,30 @@ def pseudolabel_passes_family_filter(prompt_family: str, answer_type: str, pred:
     return False
 
 
+def family_specific_verifier(prompt_family: str, prompt: str, answer: str) -> bool:
+    prompt = str(prompt)
+    answer = canonicalize_answer(answer)
+    if prompt_family == "bit_transform":
+        if not BINARY_RE.fullmatch(answer):
+            return False
+        binary_spans = re.findall(r"\b[01]{3,}\b", prompt)
+        if not binary_spans:
+            return len(answer) <= 64
+        allowed_lengths = {len(span) for span in binary_spans}
+        return len(answer) in allowed_lengths
+    if prompt_family == "sequence":
+        if not ANSWER_NUMBER_RE.fullmatch(answer.replace(",", "")):
+            return False
+        return len(answer.replace(",", "")) <= 24 and not bool(re.search(r"[^0-9+\-.]", answer))
+    if prompt_family == "matrix_reasoning":
+        if BINARY_RE.fullmatch(answer):
+            return len(answer) <= 32
+        if ANSWER_NUMBER_RE.fullmatch(answer.replace(",", "")):
+            return len(answer.replace(",", "")) <= 24
+        return False
+    return False
+
+
 @torch.no_grad()
 def build_consensus_pseudolabels(model: torch.nn.Module, unlabeled_df: pd.DataFrame, template_ids: Sequence[str], max_rows: int = 128) -> pd.DataFrame:
     rows = []
@@ -1612,6 +1648,8 @@ def build_consensus_pseudolabels(model: torch.nn.Module, unlabeled_df: pd.DataFr
         if result["votes"] != result["num_templates"]:
             continue
         if not pseudolabel_passes_family_filter(prompt_family, answer_type, result["pred"]):
+            continue
+        if not family_specific_verifier(prompt_family, row.prompt, result["pred"]):
             continue
         rows.append(
             {
@@ -1799,31 +1837,77 @@ def perform_conservative_template_refresh(
     return template_score_df, family_template_map_df, family_template_full_df, template_update_decisions_df
 
 
+def replay_family_concentration(train_records_df: pd.DataFrame, replay_buffer: Dict[str, int]) -> Tuple[float, Optional[str]]:
+    if not replay_buffer:
+        return 0.0, None
+    replay_df = train_records_df.loc[train_records_df["id"].isin(replay_buffer.keys()), ["id", "prompt_family"]].copy()
+    if replay_df.empty:
+        return 0.0, None
+    family_share = replay_df["prompt_family"].value_counts(normalize=True)
+    return float(family_share.iloc[0]), str(family_share.index[0])
+
+
+def should_refresh_stage2_assets(
+    round_idx: int,
+    pred_df: pd.DataFrame,
+    train_records_df: pd.DataFrame,
+    replay_buffer: Dict[str, int],
+    refresh_state: Dict[str, Any],
+) -> Tuple[bool, List[str], Dict[str, Any]]:
+    round_number = round_idx + 1
+    if round_number >= cfg.stage2_rounds:
+        return False, [], refresh_state
+
+    reasons: List[str] = []
+    if cfg.stage2_asset_refresh_interval_rounds > 0 and round_number % cfg.stage2_asset_refresh_interval_rounds == 0:
+        reasons.append("interval")
+
+    family_acc = pred_df.groupby("prompt_family")["hit"].mean().sort_values()
+    weak_family_k = min(max(cfg.stage2_refresh_weak_family_top_k, 1), len(family_acc))
+    weak_family_mean = float(family_acc.head(weak_family_k).mean()) if weak_family_k > 0 else 0.0
+    prev_weak_family_mean = refresh_state.get("weak_family_mean")
+    if prev_weak_family_mean is not None and weak_family_mean <= prev_weak_family_mean + cfg.stage2_refresh_min_weak_family_gain:
+        reasons.append("weak_family_stalled")
+    refresh_state["weak_family_mean"] = weak_family_mean
+
+    concentration, dominant_family = replay_family_concentration(train_records_df, replay_buffer)
+    refresh_state["replay_concentration"] = concentration
+    if concentration >= cfg.stage2_refresh_replay_family_error_threshold:
+        reasons.append(f"replay_concentrated::{dominant_family}")
+
+    return bool(reasons), reasons, refresh_state
+
+
 def maybe_refresh_stage2_assets(
     model: torch.nn.Module,
     round_idx: int,
     replay_buffer: Dict[str, int],
     hard_profile: Dict[str, Dict[str, float]],
+    pred_df: pd.DataFrame,
+    train_records_df: pd.DataFrame,
+    refresh_state: Dict[str, Any],
     refresh_assets_fn: Optional[Callable[[torch.nn.Module, int], Optional[Dict[str, Any]]]] = None,
-) -> Optional[Dict[str, Any]]:
+) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any], List[str]]:
     if refresh_assets_fn is None:
-        return None
-    if cfg.stage2_asset_refresh_interval_rounds <= 0:
-        return None
-    round_number = round_idx + 1
-    if round_number >= cfg.stage2_rounds:
-        return None
-    if round_number % cfg.stage2_asset_refresh_interval_rounds != 0:
-        return None
-    refreshed = refresh_assets_fn(model, round_number)
+        return None, refresh_state, []
+    need_refresh, reasons, refresh_state = should_refresh_stage2_assets(
+        round_idx,
+        pred_df,
+        train_records_df,
+        replay_buffer,
+        refresh_state,
+    )
+    if not need_refresh:
+        return None, refresh_state, []
+    refreshed = refresh_assets_fn(model, round_idx + 1)
     if refreshed is None:
-        return None
+        return None, refresh_state, reasons
     refreshed["sample_weights"] = compute_sample_weights(
         refreshed["train_records_df"],
         hard_profile=hard_profile,
         replay_buffer=replay_buffer,
     )
-    return refreshed
+    return refreshed, refresh_state, reasons
 
 
 def train_stage2_with_reweight(
@@ -1838,6 +1922,7 @@ def train_stage2_with_reweight(
     current_weights = initial_weights
     last_pred_df = pd.DataFrame()
     replay_buffer = dict(replay_buffer or {})
+    refresh_state: Dict[str, Any] = {}
     per_round_epochs = cfg.stage2_epochs / max(cfg.stage2_rounds, 1)
 
     for round_idx in range(cfg.stage2_rounds):
@@ -1866,11 +1951,14 @@ def train_stage2_with_reweight(
         replay_buffer = update_replay_buffer(replay_buffer, replay_probe_pred_df)
         current_weights = compute_sample_weights(train_records_df, hard_profile=hard_profile, replay_buffer=replay_buffer)
         print(f"replay probe accuracy round {round_idx + 1}: {probe_acc:.4f}; replay buffer size={len(replay_buffer)}")
-        refreshed_assets = maybe_refresh_stage2_assets(
+        refreshed_assets, refresh_state, refresh_reasons = maybe_refresh_stage2_assets(
             model,
             round_idx,
             replay_buffer,
             hard_profile,
+            last_pred_df,
+            train_records_df,
+            refresh_state,
             refresh_assets_fn=refresh_assets_fn,
         )
         if refreshed_assets is not None:
@@ -1878,7 +1966,7 @@ def train_stage2_with_reweight(
             eval_dataset = refreshed_assets["eval_dataset"]
             train_records_df = refreshed_assets["train_records_df"]
             current_weights = refreshed_assets["sample_weights"]
-            print(f"stage2 assets refreshed after round {round_idx + 1}; new train rows={len(train_records_df)}")
+            print(f"stage2 assets refreshed after round {round_idx + 1}; reasons={','.join(refresh_reasons)}; new train rows={len(train_records_df)}")
         print(
             f"refreshed weights after round {round_idx + 1}:",
             np.quantile(current_weights, [0, 0.25, 0.5, 0.75, 1]),
