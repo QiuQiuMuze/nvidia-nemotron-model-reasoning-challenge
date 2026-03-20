@@ -1427,6 +1427,71 @@ def inspect_generation_completion_sanity(
 
 
 @torch.no_grad()
+def predict_one_row(
+    model: torch.nn.Module,
+    row: Any,
+    template_ids: Optional[Sequence[str]] = None,
+    fallback_template_id: Optional[str] = None,
+    max_new_tokens_grid: Sequence[int] = (64, 96),
+    extractor_fn=metric_extract_prediction,
+) -> Dict[str, Any]:
+    prompt_text = row.prompt if hasattr(row, "prompt") else row["prompt"]
+    if hasattr(row, "answer"):
+        gold = canonicalize_answer(row.answer)
+    elif isinstance(row, dict) and "answer" in row:
+        gold = canonicalize_answer(row["answer"])
+    else:
+        gold = ""
+    prompt_family = infer_prompt_family(prompt_text)
+    answer_type = infer_expected_answer_type_from_prompt(prompt_text)
+    routed_templates = list(template_ids or router_get_templates(prompt_family, answer_type=answer_type))
+    final_candidates: List[Dict[str, Any]] = []
+    for max_new_tokens in max_new_tokens_grid:
+        final_candidates = infer_with_multi_templates(
+            model,
+            {"prompt": prompt_text},
+            template_ids=routed_templates,
+            max_new_tokens=max_new_tokens,
+            extractor_fn=extractor_fn,
+        )
+        aggregate = aggregate_candidates(final_candidates, answer_type=answer_type, preferred_template_ids=routed_templates)
+        if aggregate["decision_type"] == "majority":
+            break
+
+    aggregate = aggregate_candidates(final_candidates, answer_type=answer_type, preferred_template_ids=routed_templates)
+    fallback_used = False
+    fallback_id = fallback_template_id or cfg.fallback_template_id
+    if aggregate["needs_fallback"] and fallback_id not in routed_templates and fallback_id in TEMPLATE_POOL:
+        fallback_used = True
+        fallback_candidates = infer_with_multi_templates(
+            model,
+            {"prompt": prompt_text},
+            template_ids=[fallback_id],
+            max_new_tokens=max_new_tokens_grid[-1],
+            extractor_fn=extractor_fn,
+        )
+        final_candidates = list(final_candidates) + list(fallback_candidates)
+        aggregate = aggregate_candidates(
+            final_candidates,
+            answer_type=answer_type,
+            preferred_template_ids=[fallback_id] + routed_templates,
+        )
+
+    return {
+        "pred": aggregate["pred"],
+        "consensus_votes": aggregate["vote_count"],
+        "num_templates": len(final_candidates),
+        "decision_type": aggregate["decision_type"],
+        "fallback_used": fallback_used,
+        "template_ids": [c["template_id"] for c in final_candidates],
+        "candidates": final_candidates,
+        "prompt_family": prompt_family,
+        "answer_type": answer_type,
+        "gold": gold,
+    }
+
+
+@torch.no_grad()
 def evaluate_accuracy(
     model: torch.nn.Module,
     df: pd.DataFrame,
@@ -1436,33 +1501,27 @@ def evaluate_accuracy(
 ) -> Tuple[float, pd.DataFrame]:
     rows = []
     for row in df.itertuples(index=False):
-        answer_type = infer_expected_answer_type_from_prompt(row.prompt)
         prompt_family = infer_prompt_family(row.prompt)
-        template_id, prompt = choose_template(row.prompt, answer_type, prompt_family)
-        if template_override is not None:
-            template_id = template_override
-            prompt = TEMPLATE_POOL[template_id](row.prompt)
-
-        candidate_raw = None
-        candidate_pred = None
-        boxed_hit = False
-        boxed_parsed_success = False
-        for max_new_tokens in max_new_tokens_grid:
-            raw = generate_answer_text(model, prompt, max_new_tokens=max_new_tokens).strip()
-            boxed_matches = BOXED_RE.findall(raw)
-            pred = extractor_fn(raw)
-            if "\\boxed{" in raw:
-                candidate_raw = raw
-                candidate_pred = pred
-                boxed_hit = True
-                boxed_parsed_success = bool(boxed_matches)
-                break
-            if candidate_raw is None:
-                candidate_raw = raw
-                candidate_pred = pred
-                boxed_parsed_success = bool(boxed_matches)
-
+        answer_type = infer_expected_answer_type_from_prompt(row.prompt)
+        routed_templates = [template_override] if template_override is not None else router_get_templates(
+            prompt_family,
+            answer_type=answer_type,
+            top_k=1,
+        )
+        result = predict_one_row(
+            model,
+            row,
+            template_ids=routed_templates,
+            fallback_template_id=None if template_override is not None else cfg.fallback_template_id,
+            max_new_tokens_grid=max_new_tokens_grid,
+            extractor_fn=extractor_fn,
+        )
+        matched_candidate = next((c for c in result["candidates"] if c.get("answer") == result["pred"]), None)
+        candidate_raw = matched_candidate["raw"] if matched_candidate is not None else (result["candidates"][0]["raw"] if result["candidates"] else "")
+        boxed_hit = any(candidate.get("has_boxed", False) for candidate in result["candidates"])
+        boxed_parsed_success = any(bool(candidate.get("boxed_answer")) for candidate in result["candidates"])
         gold = canonicalize_answer(row.answer)
+        candidate_pred = result["pred"]
         if approx_equal(candidate_pred, gold):
             failure_type = "correct"
         elif not boxed_hit:
@@ -1490,7 +1549,7 @@ def evaluate_accuracy(
                     include_lowest=True,
                 )[0],
                 "source": getattr(row, "source", "official_train"),
-                "template_id": template_id,
+                "template_id": result["template_ids"][0] if result["template_ids"] else "",
                 "gold": gold,
                 "pred": candidate_pred,
                 "hit": approx_equal(candidate_pred, gold),
@@ -1498,6 +1557,10 @@ def evaluate_accuracy(
                 "boxed_parsed_success": boxed_parsed_success,
                 "failure_type": failure_type,
                 "raw": candidate_raw[:1200],
+                "consensus_votes": result["consensus_votes"],
+                "num_templates": result["num_templates"],
+                "decision_type": result["decision_type"],
+                "fallback_used": result["fallback_used"],
             }
         )
     out = pd.DataFrame(rows)
@@ -1871,67 +1934,25 @@ def submission_style_predict_row(
     max_new_tokens_grid: Sequence[int] = (64, 96),
     extractor_fn=metric_extract_prediction,
 ) -> Dict[str, Any]:
-    prompt_text = row.prompt if hasattr(row, "prompt") else row["prompt"]
-    if hasattr(row, "answer"):
-        gold = canonicalize_answer(row.answer)
-    elif isinstance(row, dict) and "answer" in row:
-        gold = canonicalize_answer(row["answer"])
-    else:
-        gold = ""
-    prompt_family = infer_prompt_family(prompt_text)
-    answer_type = infer_expected_answer_type_from_prompt(prompt_text)
-    routed_templates = list(template_ids or router_get_templates(prompt_family, answer_type=answer_type))
-    final_candidates: List[Dict[str, Any]] = []
-    for max_new_tokens in max_new_tokens_grid:
-        final_candidates = infer_with_multi_templates(
-            model,
-            {"prompt": prompt_text},
-            template_ids=routed_templates,
-            max_new_tokens=max_new_tokens,
-            extractor_fn=extractor_fn,
-        )
-        aggregate = aggregate_candidates(final_candidates, answer_type=answer_type, preferred_template_ids=routed_templates)
-        if aggregate["decision_type"] == "majority":
-            break
-
-    aggregate = aggregate_candidates(final_candidates, answer_type=answer_type, preferred_template_ids=routed_templates)
-    fallback_used = False
-    fallback_id = fallback_template_id or cfg.fallback_template_id
-    if aggregate["needs_fallback"] and fallback_id not in routed_templates and fallback_id in TEMPLATE_POOL:
-        fallback_used = True
-        fallback_candidates = infer_with_multi_templates(
-            model,
-            {"prompt": prompt_text},
-            template_ids=[fallback_id],
-            max_new_tokens=max_new_tokens_grid[-1],
-            extractor_fn=extractor_fn,
-        )
-        final_candidates = list(final_candidates) + list(fallback_candidates)
-        aggregate = aggregate_candidates(
-            final_candidates,
-            answer_type=answer_type,
-            preferred_template_ids=[fallback_id] + routed_templates,
-        )
-
-    return {
-        "pred": aggregate["pred"],
-        "consensus_votes": aggregate["vote_count"],
-        "num_templates": len(final_candidates),
-        "decision_type": aggregate["decision_type"],
-        "fallback_used": fallback_used,
-        "template_ids": [c["template_id"] for c in final_candidates],
-        "candidates": final_candidates,
-        "prompt_family": prompt_family,
-        "answer_type": answer_type,
-        "gold": gold,
-    }
+    return predict_one_row(
+        model,
+        row,
+        template_ids=template_ids,
+        fallback_template_id=fallback_template_id,
+        max_new_tokens_grid=max_new_tokens_grid,
+        extractor_fn=extractor_fn,
+    )
 
 
 @torch.no_grad()
-def evaluate_with_consensus(model: torch.nn.Module, df: pd.DataFrame, template_ids: Sequence[str]) -> Tuple[float, pd.DataFrame]:
+def evaluate_with_consensus(
+    model: torch.nn.Module,
+    df: pd.DataFrame,
+    template_ids: Optional[Sequence[str]] = None,
+) -> Tuple[float, pd.DataFrame]:
     rows = []
     for row in df.itertuples(index=False):
-        result = submission_style_predict_row(model, row, template_ids=template_ids)
+        result = predict_one_row(model, row, template_ids=template_ids)
         gold = canonicalize_answer(row.answer)
         rows.append(
             {
@@ -1964,7 +1985,7 @@ def offline_submission_style_eval(
             answer_type=infer_expected_answer_type_from_prompt(row.prompt),
             top_k=top_k,
         )
-        result = submission_style_predict_row(
+        result = predict_one_row(
             model,
             row,
             template_ids=routed_templates,
@@ -2044,7 +2065,7 @@ def build_consensus_pseudolabels(
         prompt_family = infer_prompt_family(row.prompt)
         if weak_family_set and prompt_family not in weak_family_set:
             continue
-        result = submission_style_predict_row(model, row, template_ids=template_ids)
+        result = predict_one_row(model, row, template_ids=template_ids)
         answer_type = infer_answer_shape_from_gold(result["pred"])
         template_vote_ratio = result["consensus_votes"] / max(result["num_templates"], 1)
         self_consistency_ratio = 1.0 if result["decision_type"] == "majority" else template_vote_ratio
@@ -2078,7 +2099,7 @@ def build_consensus_pseudolabels(
 def summarize_template_disagreement(model: torch.nn.Module, df: pd.DataFrame, template_ids: Sequence[str], max_rows: int = 128) -> pd.DataFrame:
     rows = []
     for row in df.head(max_rows).itertuples(index=False):
-        result = submission_style_predict_row(model, row, template_ids=template_ids)
+        result = predict_one_row(model, row, template_ids=template_ids)
         disagreement = 1.0 - (result["consensus_votes"] / max(result["num_templates"], 1))
         rows.append(
             {
