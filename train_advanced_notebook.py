@@ -43,6 +43,49 @@ if INSTALL_PACKAGES:
         check=True,
     )
 
+
+# %% [markdown]
+# ## Cell 1.5 — 导入依赖与全局配置
+# 让 Python 先从这个离线 build 里找包
+
+
+import sys
+import os
+from pathlib import Path
+
+MAMBA_DIST = Path("/kaggle/input/notebooks/federicoizzi/mamba-conv1d-build-t4/dist")
+
+sys.path.insert(0, str(MAMBA_DIST))
+
+os.environ["PYTHONPATH"] = f"{MAMBA_DIST}:{os.environ.get('PYTHONPATH', '')}"
+
+# 把可能用到的 CUDA / Triton / torch 动态库路径也挂进去
+extra_lib_dirs = [
+    MAMBA_DIST,
+    MAMBA_DIST / "nvidia" / "cuda_runtime" / "lib",
+    MAMBA_DIST / "nvidia" / "cublas" / "lib",
+    MAMBA_DIST / "nvidia" / "curand" / "lib",
+    MAMBA_DIST / "nvidia" / "nccl" / "lib",
+    MAMBA_DIST / "nvidia" / "cufft" / "lib",
+    MAMBA_DIST / "nvidia" / "cuda_nvrtc" / "lib",
+    MAMBA_DIST / "nvidia" / "cudnn" / "lib",
+    MAMBA_DIST / "nvidia" / "cusparse" / "lib",
+    MAMBA_DIST / "nvidia" / "cusolver" / "lib",
+    MAMBA_DIST / "nvidia" / "nvjitlink" / "lib",
+    MAMBA_DIST / "nvidia" / "nvtx" / "lib",
+    MAMBA_DIST / "nvidia" / "cufile" / "lib",
+    MAMBA_DIST / "torch" / "lib",
+    MAMBA_DIST / "triton" / "_C",
+]
+
+existing = os.environ.get("LD_LIBRARY_PATH", "")
+os.environ["LD_LIBRARY_PATH"] = ":".join(
+    [str(p) for p in extra_lib_dirs if p.exists()] + ([existing] if existing else [])
+)
+
+print("MAMBA_DIST =", MAMBA_DIST)
+print("exists =", MAMBA_DIST.exists())
+
 # %% [markdown]
 # ## Cell 2 — 导入依赖与全局配置
 # 这里把所有“竞赛硬约束”显式写进配置，避免训练流程偏离提交规则。
@@ -89,7 +132,7 @@ from transformers import (
 @dataclass
 class CFG:
     # ===== competition =====
-    base_model: str = "nvidia/Nemotron-3-Nano-30B-Base-8K"
+    base_model: str = "/kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1"
     max_lora_rank: int = 32
     official_max_new_tokens: int = 7680
     official_temperature: float = 0.0
@@ -248,13 +291,35 @@ if torch.cuda.is_available():
 # - 如果你后续做 synthetic / self-distill / external reasoning mix，只需要拼成相同列结构即可。
 
 # %%
-train_path = Path(cfg.competition_path) / "train.csv"
-test_path = Path(cfg.competition_path) / "test.csv"
+all_train = list(Path("/kaggle/input").rglob("train.csv"))
+all_test = list(Path("/kaggle/input").rglob("test.csv"))
 
-if not train_path.exists():
-    # 兼容仓库本地调试
-    train_path = Path("train.csv")
-    test_path = Path("test.csv")
+print("Found train files:")
+for p in all_train:
+    print("  ", p)
+
+print("Found test files:")
+for p in all_test:
+    print("  ", p)
+
+# 只保留同时存在 train.csv 和 test.csv 的目录
+candidate_roots = []
+for p in all_train:
+    root = p.parent
+    if (root / "test.csv").exists():
+        candidate_roots.append(root)
+
+if not candidate_roots:
+    raise FileNotFoundError("在 /kaggle/input 下没找到同时包含 train.csv 和 test.csv 的目录")
+
+# 取第一个候选目录
+data_root = candidate_roots[0]
+train_path = data_root / "train.csv"
+test_path = data_root / "test.csv"
+
+print("Using data root:", data_root)
+print("Using train:", train_path)
+print("Using test :", test_path)
 
 train_df = pd.read_csv(train_path)
 test_df = pd.read_csv(test_path)
@@ -263,7 +328,6 @@ assert {"id", "prompt", "answer"}.issubset(train_df.columns)
 assert {"id", "prompt"}.issubset(test_df.columns)
 
 train_df["source"] = "official_train"
-
 
 def load_optional_external_data(extra_root: str) -> pd.DataFrame:
     """可选外挂数据接口。
@@ -1016,7 +1080,11 @@ print("stable families used in stage1:", sorted(stable_families)[:20])
 # 这里保守起见直接使用手写模板，确保迁移到 Kaggle 更稳定。
 
 # %%
-tokenizer = AutoTokenizer.from_pretrained(cfg.base_model, trust_remote_code=True)
+tokenizer = AutoTokenizer.from_pretrained(
+    cfg.base_model,
+    trust_remote_code=True,
+    local_files_only=True,
+)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -1205,15 +1273,15 @@ def build_quant_config() -> Optional[BitsAndBytesConfig]:
         bnb_4bit_use_double_quant=True,
     )
 
-
 def load_training_model() -> Tuple[torch.nn.Module, List[str]]:
     model = AutoModelForCausalLM.from_pretrained(
         cfg.base_model,
         quantization_config=build_quant_config(),
-        torch_dtype=torch.bfloat16 if cfg.use_bf16 else torch.float16,
+        dtype=torch.bfloat16 if cfg.use_bf16 else torch.float16,
         device_map="auto",
         trust_remote_code=True,
         attn_implementation="flash_attention_2",
+        local_files_only=True,
     )
     model.config.use_cache = False
     model = prepare_model_for_kbit_training(model)
@@ -2205,7 +2273,7 @@ def maybe_extend_stage2_with_pseudolabels(
     pseudo_df = pseudo_df.assign(
         prompt_family=pseudo_df["prompt"].map(infer_prompt_family),
         template_group=pseudo_df["prompt"].map(infer_template_group),
-        answer_type=pseudo_df["answer"].map(infer_answer_type),
+        answer_type=pseudo_df["answer"].map(infer_answer_shape_from_gold),
         prompt_chars=pseudo_df["prompt"].str.len(),
         answer_chars=pseudo_df["answer"].astype(str).str.len(),
         example_len_bucket=pd.cut(
