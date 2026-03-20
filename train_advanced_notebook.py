@@ -235,13 +235,35 @@ if torch.cuda.is_available():
 # - 如果你后续做 synthetic / self-distill / external reasoning mix，只需要拼成相同列结构即可。
 
 # %%
-train_path = Path(cfg.competition_path) / "train.csv"
-test_path = Path(cfg.competition_path) / "test.csv"
+all_train = list(Path("/kaggle/input").rglob("train.csv"))
+all_test = list(Path("/kaggle/input").rglob("test.csv"))
 
-if not train_path.exists():
-    # 兼容仓库本地调试
-    train_path = Path("train.csv")
-    test_path = Path("test.csv")
+print("Found train files:")
+for p in all_train:
+    print("  ", p)
+
+print("Found test files:")
+for p in all_test:
+    print("  ", p)
+
+# 只保留同时存在 train.csv 和 test.csv 的目录
+candidate_roots = []
+for p in all_train:
+    root = p.parent
+    if (root / "test.csv").exists():
+        candidate_roots.append(root)
+
+if not candidate_roots:
+    raise FileNotFoundError("在 /kaggle/input 下没找到同时包含 train.csv 和 test.csv 的目录")
+
+# 取第一个候选目录
+data_root = candidate_roots[0]
+train_path = data_root / "train.csv"
+test_path = data_root / "test.csv"
+
+print("Using data root:", data_root)
+print("Using train:", train_path)
+print("Using test :", test_path)
 
 train_df = pd.read_csv(train_path)
 test_df = pd.read_csv(test_path)
@@ -250,7 +272,6 @@ assert {"id", "prompt", "answer"}.issubset(train_df.columns)
 assert {"id", "prompt"}.issubset(test_df.columns)
 
 train_df["source"] = "official_train"
-
 
 def load_optional_external_data(extra_root: str) -> pd.DataFrame:
     """可选外挂数据接口。
@@ -2308,7 +2329,7 @@ def maybe_extend_stage2_with_pseudolabels(
     pseudo_df = pseudo_df.assign(
         prompt_family=pseudo_df["prompt"].map(infer_prompt_family),
         template_group=pseudo_df["prompt"].map(infer_template_group),
-        answer_type=pseudo_df["answer"].map(infer_answer_type),
+        answer_type=pseudo_df["answer"].map(infer_answer_shape_from_gold),
         prompt_chars=pseudo_df["prompt"].str.len(),
         answer_chars=pseudo_df["answer"].astype(str).str.len(),
         example_len_bucket=pd.cut(
