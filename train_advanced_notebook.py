@@ -109,6 +109,8 @@ class CFG:
     eval_steps: int = 100
     max_grad_norm: float = 0.3
     enable_gradient_checkpointing: bool = False
+    force_nemotron_torch_fallback: bool = False
+    cuda_load_headroom_gib: int = 6
 
     # ===== lora =====
     lora_r: int = 32
@@ -1284,6 +1286,11 @@ def patch_nemotron_mamba_modules_to_torch_fallback(model: torch.nn.Module) -> in
 
 
 def force_nemotron_torch_fallback(model: torch.nn.Module, tag: str = "") -> int:
+    if not cfg.force_nemotron_torch_fallback:
+        prefix = f"[{tag}] " if tag else ""
+        print(f"{prefix}Keeping Nemotron native CUDA fast path enabled.")
+        return 0
+
     disable_nemotron_fast_path_globally()
     patched = patch_nemotron_mamba_modules_to_torch_fallback(model)
     prefix = f"[{tag}] " if tag else ""
@@ -1291,8 +1298,9 @@ def force_nemotron_torch_fallback(model: torch.nn.Module, tag: str = "") -> int:
     return patched
 
 
-# 先执行一次全局 patch
-disable_nemotron_fast_path_globally()
+# 仅在显式要求时才执行全局 patch；默认保留原生 CUDA fast path，避免 torch fallback 的显存膨胀。
+if cfg.force_nemotron_torch_fallback:
+    disable_nemotron_fast_path_globally()
 # %% [markdown]
 # ## Cell 13 — 加载基座模型 + 自动发现 LoRA target modules（离线稳定版）
 
@@ -1344,6 +1352,25 @@ def resolve_attn_implementation() -> Optional[str]:
     return "eager"
 
 
+def build_model_max_memory() -> Optional[Dict[str, str]]:
+    if not torch.cuda.is_available():
+        return None
+
+    max_memory: Dict[str, str] = {}
+    reserve_gib = max(1, int(cfg.cuda_load_headroom_gib))
+
+    for device_idx in range(torch.cuda.device_count()):
+        total_gib = torch.cuda.get_device_properties(device_idx).total_memory / (1024 ** 3)
+        usable_gib = max(1, math.floor(total_gib - reserve_gib))
+        max_memory[str(device_idx)] = f"{usable_gib}GiB"
+
+    if hasattr(os, "sysconf") and "SC_PAGE_SIZE" in os.sysconf_names and "SC_PHYS_PAGES" in os.sysconf_names:
+        total_cpu_gib = (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")) / (1024 ** 3)
+        max_memory["cpu"] = f"{max(8, math.floor(total_cpu_gib - 8))}GiB"
+
+    return max_memory
+
+
 def build_model_load_kwargs(
     quant_config: Optional[BitsAndBytesConfig],
     attn_implementation: Optional[str],
@@ -1355,6 +1382,10 @@ def build_model_load_kwargs(
         "local_files_only": True,
         "low_cpu_mem_usage": True,
     }
+
+    max_memory = build_model_max_memory()
+    if max_memory is not None:
+        load_kwargs["max_memory"] = max_memory
 
     if quant_config is not None:
         load_kwargs["quantization_config"] = quant_config
