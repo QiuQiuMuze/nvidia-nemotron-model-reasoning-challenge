@@ -73,7 +73,7 @@ from transformers import (
 @dataclass
 class CFG:
     # ===== competition =====
-    base_model: str = "nvidia/Nemotron-3-Nano-30B-Base-8K"
+    base_model: str = "/kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1"
     local_files_only: bool = True
     trust_remote_code: bool = True
     preferred_attn_implementation: str = "flash_attention_2"
@@ -82,9 +82,10 @@ class CFG:
     official_temperature: float = 0.0
     official_top_p: float = 1.0
     official_max_model_len: int = 8192
+    warmup_steps_override: Optional[int] = None
 
     # ===== paths =====
-    competition_path: str = "/kaggle/input/nvidia-nemotron-model-reasoning-challenge"
+    competition_path: str = "/kaggle/input/competitions/nvidia-nemotron-model-reasoning-challenge"
     extra_data_dir: str = "/kaggle/input"
     work_dir: str = "/kaggle/working/nemotron_advanced"
     output_dir: str = "/kaggle/working/nemotron_advanced/checkpoints"
@@ -107,6 +108,7 @@ class CFG:
     save_steps: int = 100
     eval_steps: int = 100
     max_grad_norm: float = 0.3
+    enable_gradient_checkpointing: bool = False
 
     # ===== lora =====
     lora_r: int = 32
@@ -1017,42 +1019,32 @@ print("stage1 records:", stage1_records.shape)
 print("stage2 records:", stage2_records.shape)
 print("stable families used in stage1:", sorted(stable_families)[:20])
 
+
 # %% [markdown]
 # ## Cell 11 — 加载 tokenizer
-# 
-# Nemotron 系列 tokenizer 若带 chat template，可自行替换成 `apply_chat_template` 版本。
-# 这里保守起见直接使用手写模板，确保迁移到 Kaggle 更稳定。
 
 # %%
 def load_tokenizer_local() -> AutoTokenizer:
-    attempt_trust_remote = [cfg.trust_remote_code]
-    if cfg.trust_remote_code:
-        attempt_trust_remote.append(False)
-    errors: List[str] = []
-    for trust_remote_code in attempt_trust_remote:
-        try:
-            tokenizer_local = AutoTokenizer.from_pretrained(
-                cfg.base_model,
-                trust_remote_code=trust_remote_code,
-                local_files_only=cfg.local_files_only,
-            )
-            print(
-                "tokenizer load mode:",
-                {
-                    "trust_remote_code": trust_remote_code,
-                    "local_files_only": cfg.local_files_only,
-                },
-            )
-            return tokenizer_local
-        except Exception as exc:
-            errors.append(f"trust_remote_code={trust_remote_code}: {type(exc).__name__}: {exc}")
-    raise RuntimeError(
-        "Unable to load the tokenizer from local files with the currently installed packages.\n"
-        + "\n".join(errors)
+    model_path = Path(cfg.base_model)
+
+    if not model_path.exists():
+        raise RuntimeError(
+            f"Local model path does not exist: {cfg.base_model}"
+        )
+
+    print("Loading tokenizer from:", model_path)
+
+    tokenizer_local = AutoTokenizer.from_pretrained(
+        str(model_path),
+        trust_remote_code=True,
+        local_files_only=True,
     )
+
+    return tokenizer_local
 
 
 tokenizer = load_tokenizer_local()
+
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -1202,12 +1194,107 @@ valid_ds = valid_variant_ds[cfg.primary_supervision_variant]
 print(stage2_ds[0].keys())
 print("non-masked labels:", sum(x != -100 for x in stage2_ds[0]["labels"]))
 
+
+
 # %% [markdown]
-# ## Cell 13 — 加载 4-bit 基座模型 + 自动发现 LoRA target modules
-# 
-# 高级版不把 target modules 写死在 `q_proj/k_proj/v_proj/o_proj`：
-# Nemotron / Llama 系模型中，MLP 的 `gate/up/down_proj` 往往也很重要。
-# 在 rank 固定 <= 32 的前提下，覆盖 attention + MLP 往往比只训 attention 更强。
+# ## Cell 12.5 — 强制关闭 Nemotron-H fast CUDA path（更稳妥版）
+#
+# 目标：
+# 1. 关闭模块级 fast path 标志
+# 2. 关闭类级别 forward -> cuda_kernels_forward 分支
+# 3. 对已经实例化的模块再次做实例级补丁
+#
+# 这样做不会改变训练目标、LoRA 结构和 loss，只是把不兼容的 fused CUDA kernel
+# 改成 torch fallback，保证 Kaggle 当前 GPU / 预编译环境可运行。
+
+# %%
+import types
+import transformers.models.nemotron_h.modeling_nemotron_h as nemotron_h_mod
+
+
+def disable_nemotron_fast_path_globally() -> None:
+    # 1) 模块级开关
+    if hasattr(nemotron_h_mod, "is_fast_path_available"):
+        nemotron_h_mod.is_fast_path_available = False
+        print("Disabled Nemotron-H module-level fast CUDA path.")
+    else:
+        print("Nemotron-H module-level fast path flag not found.")
+
+    # 2) 类级 monkey patch：直接让相关 mixer 永远走 torch_forward
+    patched_classes = 0
+    for name in dir(nemotron_h_mod):
+        obj = getattr(nemotron_h_mod, name)
+        if not isinstance(obj, type):
+            continue
+
+        has_torch_forward = hasattr(obj, "torch_forward")
+        has_cuda_forward = hasattr(obj, "cuda_kernels_forward")
+        has_forward = hasattr(obj, "forward")
+
+        if has_torch_forward and has_cuda_forward and has_forward:
+            # 保存原始 forward 便于排查（可选）
+            if not hasattr(obj, "_orig_forward_for_debug"):
+                obj._orig_forward_for_debug = obj.forward
+
+            def _forward_fallback(self, hidden_states, cache_params=None, attention_mask=None):
+                return self.torch_forward(hidden_states, cache_params, attention_mask)
+
+            def _cuda_fallback(self, hidden_states, cache_params=None, attention_mask=None):
+                return self.torch_forward(hidden_states, cache_params, attention_mask)
+
+            obj.forward = _forward_fallback
+            obj.cuda_kernels_forward = _cuda_fallback
+            patched_classes += 1
+
+    print(f"Patched {patched_classes} Nemotron class(es) to torch fallback.")
+
+
+def patch_nemotron_mamba_modules_to_torch_fallback(model: torch.nn.Module) -> int:
+    """
+    对已经实例化的 Nemotron mixer 再做实例级补丁。
+    这样即使类级 patch 没完全覆盖，实例也会被强制走 torch_forward。
+    """
+    patched = 0
+
+    for module in model.modules():
+        if (
+            hasattr(module, "torch_forward")
+            and hasattr(module, "cuda_kernels_forward")
+            and hasattr(module, "forward")
+            and hasattr(module, "in_proj")
+        ):
+            def _forward_fallback(self, hidden_states, cache_params=None, attention_mask=None):
+                return self.torch_forward(hidden_states, cache_params, attention_mask)
+
+            def _cuda_fallback(self, hidden_states, cache_params=None, attention_mask=None):
+                return self.torch_forward(hidden_states, cache_params, attention_mask)
+
+            module.forward = types.MethodType(_forward_fallback, module)
+            module.cuda_kernels_forward = types.MethodType(_cuda_fallback, module)
+
+            if hasattr(module, "is_fast_path_available"):
+                try:
+                    module.is_fast_path_available = False
+                except Exception:
+                    pass
+
+            patched += 1
+
+    return patched
+
+
+def force_nemotron_torch_fallback(model: torch.nn.Module, tag: str = "") -> int:
+    disable_nemotron_fast_path_globally()
+    patched = patch_nemotron_mamba_modules_to_torch_fallback(model)
+    prefix = f"[{tag}] " if tag else ""
+    print(f"{prefix}Patched {patched} instantiated Nemotron mixer module(s) to torch fallback.")
+    return patched
+
+
+# 先执行一次全局 patch
+disable_nemotron_fast_path_globally()
+# %% [markdown]
+# ## Cell 13 — 加载基座模型 + 自动发现 LoRA target modules（离线稳定版）
 
 # %%
 def discover_lora_targets(named_modules: Iterable[Tuple[str, torch.nn.Module]]) -> List[str]:
@@ -1225,6 +1312,7 @@ def discover_lora_targets(named_modules: Iterable[Tuple[str, torch.nn.Module]]) 
         suffix = name.split(".")[-1]
         if suffix in wanted_suffixes:
             candidates.append(suffix)
+
     ordered = []
     for suffix in ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]:
         if suffix in candidates:
@@ -1239,9 +1327,11 @@ def package_available(package_name: str) -> bool:
 def build_quant_config() -> Optional[BitsAndBytesConfig]:
     if not cfg.use_4bit:
         return None
+
     if not package_available("bitsandbytes"):
         print("bitsandbytes is not available locally; disabling 4-bit quantization.")
         return None
+
     return BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_compute_dtype=torch.bfloat16 if cfg.use_bf16 else torch.float16,
@@ -1251,67 +1341,58 @@ def build_quant_config() -> Optional[BitsAndBytesConfig]:
 
 
 def resolve_attn_implementation() -> Optional[str]:
-    preferred = cfg.preferred_attn_implementation
-    if preferred == "flash_attention_2" and not package_available("flash_attn"):
-        print("flash_attn is not available locally; falling back to a safer attention implementation.")
-        preferred = "sdpa" if hasattr(torch.nn.functional, "scaled_dot_product_attention") else "eager"
-    return preferred
+    return "eager"
 
 
 def build_model_load_kwargs(
     quant_config: Optional[BitsAndBytesConfig],
-    trust_remote_code: bool,
     attn_implementation: Optional[str],
 ) -> Dict[str, Any]:
     load_kwargs: Dict[str, Any] = {
-        "torch_dtype": torch.bfloat16 if cfg.use_bf16 else torch.float16,
+        "dtype": torch.bfloat16 if cfg.use_bf16 else torch.float16,
         "device_map": "auto",
-        "trust_remote_code": trust_remote_code,
-        "local_files_only": cfg.local_files_only,
+        "trust_remote_code": False,
+        "local_files_only": True,
+        "low_cpu_mem_usage": True,
     }
+
     if quant_config is not None:
         load_kwargs["quantization_config"] = quant_config
+
     if attn_implementation is not None:
         load_kwargs["attn_implementation"] = attn_implementation
+
     return load_kwargs
 
 
 def load_training_model() -> Tuple[torch.nn.Module, List[str]]:
     quant_config = build_quant_config()
     attn_implementation = resolve_attn_implementation()
+
     attempt_specs = [
         {
+            "label": "quantized_eager_builtin" if quant_config is not None else "fp16_or_bf16_eager_builtin",
             "quant_config": quant_config,
-            "trust_remote_code": cfg.trust_remote_code,
             "attn_implementation": attn_implementation,
-            "label": "preferred",
         },
         {
+            "label": "fp16_or_bf16_eager_builtin_fallback",
             "quant_config": None,
-            "trust_remote_code": cfg.trust_remote_code,
             "attn_implementation": attn_implementation,
-            "label": "no_quant",
-        },
-        {
-            "quant_config": None,
-            "trust_remote_code": False,
-            "attn_implementation": "sdpa" if hasattr(torch.nn.functional, "scaled_dot_product_attention") else "eager",
-            "label": "no_quant_no_remote_code",
         },
     ]
+
     errors: List[str] = []
     model = None
     used_spec: Optional[Dict[str, Any]] = None
 
     for spec in attempt_specs:
-        if spec["label"] != "preferred" and quant_config is None and spec["quant_config"] is None and spec["trust_remote_code"] == cfg.trust_remote_code and spec["attn_implementation"] == attn_implementation:
-            continue
         try:
+            print(f"Trying load mode: {spec['label']}")
             model = AutoModelForCausalLM.from_pretrained(
                 cfg.base_model,
                 **build_model_load_kwargs(
                     quant_config=spec["quant_config"],
-                    trust_remote_code=spec["trust_remote_code"],
                     attn_implementation=spec["attn_implementation"],
                 ),
             )
@@ -1321,36 +1402,58 @@ def load_training_model() -> Tuple[torch.nn.Module, List[str]]:
             errors.append(f"{spec['label']}: {type(exc).__name__}: {exc}")
 
     if model is None:
-        error_text = "\n".join(errors)
         raise RuntimeError(
-            "Unable to load the base model from local files with the currently installed packages. "
-            "Please ensure the checkpoint is cached locally and compatible with the available dependencies.\n"
-            f"Attempts:\n{error_text}"
+            "Unable to load the base model in the current offline environment.\n"
+            "Attempts:\n" + "\n".join(errors)
         )
 
     print(
         "model load mode:",
         {
-            "label": used_spec["label"] if used_spec is not None else "unknown",
-            "quantized": used_spec["quant_config"] is not None if used_spec is not None else False,
-            "trust_remote_code": used_spec["trust_remote_code"] if used_spec is not None else cfg.trust_remote_code,
-            "attn_implementation": used_spec["attn_implementation"] if used_spec is not None else attn_implementation,
-            "local_files_only": cfg.local_files_only,
+            "label": used_spec["label"],
+            "quantized": used_spec["quant_config"] is not None,
+            "trust_remote_code": False,
+            "attn_implementation": used_spec["attn_implementation"],
+            "local_files_only": True,
         },
     )
+
+    # 第一次：模型刚 load 完立刻强制 fallback
+    force_nemotron_torch_fallback(model, tag="after_load")
+
     model.config.use_cache = False
-    if used_spec is not None and used_spec["quant_config"] is not None:
+
+    if used_spec["quant_config"] is not None:
         model = prepare_model_for_kbit_training(model)
-    model.gradient_checkpointing_enable()
+        # 第二次：k-bit 预处理后再补一次，防止 wrapper/替换后丢补丁
+        force_nemotron_torch_fallback(model, tag="after_kbit_prepare")
+
+    # 某些 k-bit / PEFT 训练场景下，需要让输入支持梯度
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+
+    # 当前环境下不启用 gradient checkpointing
+    supports_gc = bool(getattr(model, "supports_gradient_checkpointing", False))
+    if cfg.enable_gradient_checkpointing and supports_gc:
+        model.gradient_checkpointing_enable()
+        print("gradient checkpointing enabled.")
+    else:
+        cfg.enable_gradient_checkpointing = False
+        print(f"{model.__class__.__name__} does not support gradient checkpointing; disabled.")
 
     discovered_targets = discover_lora_targets(model.named_modules())
+
     if cfg.allow_target_auto_discovery:
         lora_targets = discovered_targets
     else:
-        # 默认固定最终 LoRA target modules，避免实验噪声来自挂层漂移。
-        lora_targets = [module_name for module_name in cfg.target_modules_final if module_name in discovered_targets]
+        lora_targets = [
+            module_name
+            for module_name in cfg.target_modules_final
+            if module_name in discovered_targets
+        ]
 
     assert lora_targets, "未找到可用的 LoRA target modules，请检查模型结构"
+
     lora_config = LoraConfig(
         r=cfg.lora_r,
         lora_alpha=cfg.lora_alpha,
@@ -1359,14 +1462,18 @@ def load_training_model() -> Tuple[torch.nn.Module, List[str]]:
         task_type="CAUSAL_LM",
         target_modules=lora_targets,
     )
+
     model = get_peft_model(model, lora_config)
+
+    # 第三次：PEFT 包装后再补一次，确保训练时真正调用到的模块也不会回到 fast CUDA path
+    force_nemotron_torch_fallback(model, tag="after_peft")
+
     return model, lora_targets
 
 
 model, lora_targets = load_training_model()
 print("LoRA targets:", lora_targets)
 model.print_trainable_parameters()
-
 # %% [markdown]
 # ## Cell 14 — 自定义 sampler：family reweight + length bonus + difficulty curriculum
 # 
@@ -2284,12 +2391,12 @@ def build_training_args(stage_name: str, lr: float, epochs: float) -> TrainingAr
         num_train_epochs=epochs,
         learning_rate=lr,
         lr_scheduler_type="cosine",
-        warmup_ratio=cfg.warmup_ratio,
+        warmup_steps=cfg.warmup_steps_override or 0,
         per_device_train_batch_size=cfg.micro_batch_size,
         per_device_eval_batch_size=cfg.eval_batch_size,
         gradient_accumulation_steps=cfg.grad_accum,
-        gradient_checkpointing=True,
-        evaluation_strategy="steps",
+        gradient_checkpointing=False,
+        eval_strategy="steps",
         save_strategy="steps",
         eval_steps=cfg.eval_steps,
         save_steps=cfg.save_steps,
@@ -2303,9 +2410,7 @@ def build_training_args(stage_name: str, lr: float, epochs: float) -> TrainingAr
         report_to="none",
         save_total_limit=2,
         load_best_model_at_end=False,
-        label_names=["labels"],
     )
-
 
 def maybe_extend_stage2_with_pseudolabels(
     model: torch.nn.Module,
