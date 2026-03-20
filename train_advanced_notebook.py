@@ -25,23 +25,7 @@ import subprocess
 INSTALL_PACKAGES = False
 
 if INSTALL_PACKAGES:
-    subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "-q",
-            "transformers>=4.49.0",
-            "datasets>=3.2.0",
-            "peft>=0.14.0",
-            "trl>=0.15.0",
-            "accelerate>=1.2.1",
-            "bitsandbytes>=0.45.0",
-            "scikit-learn>=1.6.0",
-        ],
-        check=True,
-    )
+    raise RuntimeError("This notebook is configured for offline/preinstalled environments only; do not install extra packages at runtime.")
 
 # %% [markdown]
 # ## Cell 2 — 导入依赖与全局配置
@@ -89,7 +73,10 @@ from transformers import (
 @dataclass
 class CFG:
     # ===== competition =====
-    base_model: str = "/kaggle/input/models/metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1"
+    base_model: str = "nvidia/Nemotron-3-Nano-30B-Base-8K"
+    local_files_only: bool = True
+    trust_remote_code: bool = True
+    preferred_attn_implementation: str = "flash_attention_2"
     max_lora_rank: int = 32
     official_max_new_tokens: int = 7680
     official_temperature: float = 0.0
@@ -1037,11 +1024,35 @@ print("stable families used in stage1:", sorted(stable_families)[:20])
 # 这里保守起见直接使用手写模板，确保迁移到 Kaggle 更稳定。
 
 # %%
-tokenizer = AutoTokenizer.from_pretrained(
-    cfg.base_model,
-    trust_remote_code=True,
-    local_files_only=True,
-)
+def load_tokenizer_local() -> AutoTokenizer:
+    attempt_trust_remote = [cfg.trust_remote_code]
+    if cfg.trust_remote_code:
+        attempt_trust_remote.append(False)
+    errors: List[str] = []
+    for trust_remote_code in attempt_trust_remote:
+        try:
+            tokenizer_local = AutoTokenizer.from_pretrained(
+                cfg.base_model,
+                trust_remote_code=trust_remote_code,
+                local_files_only=cfg.local_files_only,
+            )
+            print(
+                "tokenizer load mode:",
+                {
+                    "trust_remote_code": trust_remote_code,
+                    "local_files_only": cfg.local_files_only,
+                },
+            )
+            return tokenizer_local
+        except Exception as exc:
+            errors.append(f"trust_remote_code={trust_remote_code}: {type(exc).__name__}: {exc}")
+    raise RuntimeError(
+        "Unable to load the tokenizer from local files with the currently installed packages.\n"
+        + "\n".join(errors)
+    )
+
+
+tokenizer = load_tokenizer_local()
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -1220,8 +1231,16 @@ def discover_lora_targets(named_modules: Iterable[Tuple[str, torch.nn.Module]]) 
             ordered.append(suffix)
     return ordered
 
+
+def package_available(package_name: str) -> bool:
+    return importlib.util.find_spec(package_name) is not None
+
+
 def build_quant_config() -> Optional[BitsAndBytesConfig]:
     if not cfg.use_4bit:
+        return None
+    if not package_available("bitsandbytes"):
+        print("bitsandbytes is not available locally; disabling 4-bit quantization.")
         return None
     return BitsAndBytesConfig(
         load_in_4bit=True,
@@ -1230,18 +1249,98 @@ def build_quant_config() -> Optional[BitsAndBytesConfig]:
         bnb_4bit_use_double_quant=True,
     )
 
+
+def resolve_attn_implementation() -> Optional[str]:
+    preferred = cfg.preferred_attn_implementation
+    if preferred == "flash_attention_2" and not package_available("flash_attn"):
+        print("flash_attn is not available locally; falling back to a safer attention implementation.")
+        preferred = "sdpa" if hasattr(torch.nn.functional, "scaled_dot_product_attention") else "eager"
+    return preferred
+
+
+def build_model_load_kwargs(
+    quant_config: Optional[BitsAndBytesConfig],
+    trust_remote_code: bool,
+    attn_implementation: Optional[str],
+) -> Dict[str, Any]:
+    load_kwargs: Dict[str, Any] = {
+        "torch_dtype": torch.bfloat16 if cfg.use_bf16 else torch.float16,
+        "device_map": "auto",
+        "trust_remote_code": trust_remote_code,
+        "local_files_only": cfg.local_files_only,
+    }
+    if quant_config is not None:
+        load_kwargs["quantization_config"] = quant_config
+    if attn_implementation is not None:
+        load_kwargs["attn_implementation"] = attn_implementation
+    return load_kwargs
+
+
 def load_training_model() -> Tuple[torch.nn.Module, List[str]]:
-    model = AutoModelForCausalLM.from_pretrained(
-        cfg.base_model,
-        quantization_config=build_quant_config(),
-        dtype=torch.bfloat16 if cfg.use_bf16 else torch.float16,
-        device_map="auto",
-        trust_remote_code=True,
-        attn_implementation="flash_attention_2",
-        local_files_only=True,
+    quant_config = build_quant_config()
+    attn_implementation = resolve_attn_implementation()
+    attempt_specs = [
+        {
+            "quant_config": quant_config,
+            "trust_remote_code": cfg.trust_remote_code,
+            "attn_implementation": attn_implementation,
+            "label": "preferred",
+        },
+        {
+            "quant_config": None,
+            "trust_remote_code": cfg.trust_remote_code,
+            "attn_implementation": attn_implementation,
+            "label": "no_quant",
+        },
+        {
+            "quant_config": None,
+            "trust_remote_code": False,
+            "attn_implementation": "sdpa" if hasattr(torch.nn.functional, "scaled_dot_product_attention") else "eager",
+            "label": "no_quant_no_remote_code",
+        },
+    ]
+    errors: List[str] = []
+    model = None
+    used_spec: Optional[Dict[str, Any]] = None
+
+    for spec in attempt_specs:
+        if spec["label"] != "preferred" and quant_config is None and spec["quant_config"] is None and spec["trust_remote_code"] == cfg.trust_remote_code and spec["attn_implementation"] == attn_implementation:
+            continue
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                cfg.base_model,
+                **build_model_load_kwargs(
+                    quant_config=spec["quant_config"],
+                    trust_remote_code=spec["trust_remote_code"],
+                    attn_implementation=spec["attn_implementation"],
+                ),
+            )
+            used_spec = spec
+            break
+        except Exception as exc:
+            errors.append(f"{spec['label']}: {type(exc).__name__}: {exc}")
+
+    if model is None:
+        error_text = "\n".join(errors)
+        raise RuntimeError(
+            "Unable to load the base model from local files with the currently installed packages. "
+            "Please ensure the checkpoint is cached locally and compatible with the available dependencies.\n"
+            f"Attempts:\n{error_text}"
+        )
+
+    print(
+        "model load mode:",
+        {
+            "label": used_spec["label"] if used_spec is not None else "unknown",
+            "quantized": used_spec["quant_config"] is not None if used_spec is not None else False,
+            "trust_remote_code": used_spec["trust_remote_code"] if used_spec is not None else cfg.trust_remote_code,
+            "attn_implementation": used_spec["attn_implementation"] if used_spec is not None else attn_implementation,
+            "local_files_only": cfg.local_files_only,
+        },
     )
     model.config.use_cache = False
-    model = prepare_model_for_kbit_training(model)
+    if used_spec is not None and used_spec["quant_config"] is not None:
+        model = prepare_model_for_kbit_training(model)
     model.gradient_checkpointing_enable()
 
     discovered_targets = discover_lora_targets(model.named_modules())
