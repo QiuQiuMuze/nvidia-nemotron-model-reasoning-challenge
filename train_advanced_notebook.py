@@ -43,49 +43,6 @@ if INSTALL_PACKAGES:
         check=True,
     )
 
-
-# %% [markdown]
-# ## Cell 1.5 — 导入依赖与全局配置
-# 让 Python 先从这个离线 build 里找包
-
-
-import sys
-import os
-from pathlib import Path
-
-MAMBA_DIST = Path("/kaggle/input/notebooks/federicoizzi/mamba-conv1d-build-t4/dist")
-
-sys.path.insert(0, str(MAMBA_DIST))
-
-os.environ["PYTHONPATH"] = f"{MAMBA_DIST}:{os.environ.get('PYTHONPATH', '')}"
-
-# 把可能用到的 CUDA / Triton / torch 动态库路径也挂进去
-extra_lib_dirs = [
-    MAMBA_DIST,
-    MAMBA_DIST / "nvidia" / "cuda_runtime" / "lib",
-    MAMBA_DIST / "nvidia" / "cublas" / "lib",
-    MAMBA_DIST / "nvidia" / "curand" / "lib",
-    MAMBA_DIST / "nvidia" / "nccl" / "lib",
-    MAMBA_DIST / "nvidia" / "cufft" / "lib",
-    MAMBA_DIST / "nvidia" / "cuda_nvrtc" / "lib",
-    MAMBA_DIST / "nvidia" / "cudnn" / "lib",
-    MAMBA_DIST / "nvidia" / "cusparse" / "lib",
-    MAMBA_DIST / "nvidia" / "cusolver" / "lib",
-    MAMBA_DIST / "nvidia" / "nvjitlink" / "lib",
-    MAMBA_DIST / "nvidia" / "nvtx" / "lib",
-    MAMBA_DIST / "nvidia" / "cufile" / "lib",
-    MAMBA_DIST / "torch" / "lib",
-    MAMBA_DIST / "triton" / "_C",
-]
-
-existing = os.environ.get("LD_LIBRARY_PATH", "")
-os.environ["LD_LIBRARY_PATH"] = ":".join(
-    [str(p) for p in extra_lib_dirs if p.exists()] + ([existing] if existing else [])
-)
-
-print("MAMBA_DIST =", MAMBA_DIST)
-print("exists =", MAMBA_DIST.exists())
-
 # %% [markdown]
 # ## Cell 2 — 导入依赖与全局配置
 # 这里把所有“竞赛硬约束”显式写进配置，避免训练流程偏离提交规则。
