@@ -1213,6 +1213,40 @@ print("non-masked labels:", sum(x != -100 for x in stage2_ds[0]["labels"]))
 import types
 import transformers.models.nemotron_h.modeling_nemotron_h as nemotron_h_mod
 
+import functools
+import inspect
+import transformers.models.nemotron_h.modeling_nemotron_h as nemotron_h_mod
+
+
+def patch_nemotron_create_causal_mask() -> None:
+    """
+    兼容旧参数名 input_embeds -> 新参数名 inputs_embeds
+    不改变实际功能，只是消除 FutureWarning。
+    """
+    if not hasattr(nemotron_h_mod, "create_causal_mask"):
+        print("create_causal_mask not found in nemotron_h module; skip patch.")
+        return
+
+    original_fn = nemotron_h_mod.create_causal_mask
+
+    # 防止重复 patch
+    if getattr(original_fn, "_patched_input_embeds_compat", False):
+        print("create_causal_mask already patched.")
+        return
+
+    @functools.wraps(original_fn)
+    def wrapped_create_causal_mask(*args, **kwargs):
+        if "input_embeds" in kwargs and "inputs_embeds" not in kwargs:
+            kwargs["inputs_embeds"] = kwargs.pop("input_embeds")
+        return original_fn(*args, **kwargs)
+
+    wrapped_create_causal_mask._patched_input_embeds_compat = True
+    nemotron_h_mod.create_causal_mask = wrapped_create_causal_mask
+    print("Patched nemotron_h.create_causal_mask: input_embeds -> inputs_embeds")
+
+
+patch_nemotron_create_causal_mask()
+
 
 def disable_nemotron_fast_path_globally() -> None:
     # 1) 模块级开关
@@ -1352,40 +1386,45 @@ def resolve_attn_implementation() -> Optional[str]:
     return "eager"
 
 
-def build_model_max_memory() -> Optional[Dict[str, str]]:
+from typing import Dict, Optional, Union
+
+def build_model_max_memory() -> Optional[Dict[Union[int, str], str]]:
     if not torch.cuda.is_available():
         return None
 
-    max_memory: Dict[str, str] = {}
+    max_memory: Dict[Union[int, str], str] = {}
     reserve_gib = max(1, int(cfg.cuda_load_headroom_gib))
 
     for device_idx in range(torch.cuda.device_count()):
         total_gib = torch.cuda.get_device_properties(device_idx).total_memory / (1024 ** 3)
         usable_gib = max(1, math.floor(total_gib - reserve_gib))
-        max_memory[str(device_idx)] = f"{usable_gib}GiB"
+        max_memory[device_idx] = f"{usable_gib}GiB"   # 关键：不要用 str(device_idx)
 
     if hasattr(os, "sysconf") and "SC_PAGE_SIZE" in os.sysconf_names and "SC_PHYS_PAGES" in os.sysconf_names:
         total_cpu_gib = (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")) / (1024 ** 3)
-        max_memory["cpu"] = f"{max(8, math.floor(total_cpu_gib - 8))}GiB"
+        cpu_usable = max(8, math.floor(total_cpu_gib - 8))
+        max_memory["cpu"] = f"{cpu_usable}GiB"
 
     return max_memory
-
 
 def build_model_load_kwargs(
     quant_config: Optional[BitsAndBytesConfig],
     attn_implementation: Optional[str],
 ) -> Dict[str, Any]:
     load_kwargs: Dict[str, Any] = {
-        "dtype": torch.bfloat16 if cfg.use_bf16 else torch.float16,
-        "device_map": "auto",
+        "torch_dtype": torch.bfloat16 if cfg.use_bf16 else torch.float16,
         "trust_remote_code": False,
         "local_files_only": True,
         "low_cpu_mem_usage": True,
     }
 
-    max_memory = build_model_max_memory()
-    if max_memory is not None:
-        load_kwargs["max_memory"] = max_memory
+    if torch.cuda.is_available():
+        load_kwargs["device_map"] = "auto"
+        max_memory = build_model_max_memory()
+        if max_memory is not None:
+            load_kwargs["max_memory"] = max_memory
+    else:
+        load_kwargs["device_map"] = "cpu"
 
     if quant_config is not None:
         load_kwargs["quantization_config"] = quant_config
@@ -1650,14 +1689,14 @@ print("train replay probe subset:", train_replay_probe_df.shape)
 def generate_answer_text(model: torch.nn.Module, prompt: str, max_new_tokens: int = 96) -> str:
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     input_len = inputs["input_ids"].shape[1]
+
     outputs = model.generate(
         **inputs,
         max_new_tokens=max_new_tokens,
         do_sample=False,
-        temperature=cfg.official_temperature,
-        top_p=cfg.official_top_p,
         pad_token_id=tokenizer.eos_token_id,
     )
+
     gen_ids = outputs[0][input_len:]
     return tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
 
