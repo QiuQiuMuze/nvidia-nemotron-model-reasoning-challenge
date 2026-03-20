@@ -50,6 +50,7 @@ if INSTALL_PACKAGES:
 # %%
 import gc
 import hashlib
+import importlib.util
 import io
 import json
 import math
@@ -128,6 +129,8 @@ class CFG:
     serious_eval_examples: int = 256
     serious_eval_seeds: Tuple[int, ...] = (11, 23, 47)
     numeric_rel_tol: float = 1e-2
+    prefer_official_metric_backend: bool = True
+    official_metric_backend_path: Optional[str] = None
 
     # ===== curriculum =====
     stage1_epochs: float = 0.6
@@ -151,6 +154,7 @@ class CFG:
     reasoning_template_eval_rows: int = 48
     enable_consensus_pseudolabel_refresh: bool = True
     consensus_pseudolabel_max_rows: int = 192
+    consensus_pseudolabel_allowed_families: Tuple[str, ...] = ("bit_transform", "sequence", "fewshot_pattern", "matrix_reasoning", "cipher_decrypt")
     consensus_template_ids: Tuple[str, ...] = (
         "T1_ultra_compact",
         "T3_hidden_reasoning",
@@ -158,7 +162,8 @@ class CFG:
         "T5_text_specialized",
     )
     template_ablation_after_stage1_rows: int = 128
-    template_ablation_stage2_min_gain: float = 0.0
+    template_ablation_stage2_min_gain: float = 0.02
+    template_ablation_family_min_rows: int = 10
     fixed_sanity_rows: int = 64
     stage1_family_frequency_quantile: float = 0.55
     hard_mining_family_boost: float = 0.35
@@ -190,6 +195,7 @@ Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
 Path(cfg.adapter_dir).mkdir(parents=True, exist_ok=True)
 
 assert cfg.lora_r <= cfg.max_lora_rank, "LoRA rank 超过比赛上限 32"
+assert cfg.max_seq_len <= cfg.official_max_model_len, "训练 max_seq_len 超过官方 max_model_len"
 
 # %% [markdown]
 # ## Cell 3 — 固定随机种子 / 环境检查
@@ -526,9 +532,51 @@ def extract_prediction(text: str) -> str:
     return official_like_extract_prediction(text)
 
 
+def load_official_metric_backend() -> Optional[Any]:
+    if not cfg.prefer_official_metric_backend:
+        return None
+
+    candidate_paths: List[Path] = []
+    if cfg.official_metric_backend_path:
+        candidate_paths.append(Path(cfg.official_metric_backend_path))
+    candidate_paths.extend([
+        Path(cfg.competition_path) / "evaluation.py",
+        Path(cfg.competition_path) / "metric.py",
+        Path("evaluation.py"),
+        Path("metric.py"),
+    ])
+
+    for path in candidate_paths:
+        if not path.exists():
+            continue
+        spec = importlib.util.spec_from_file_location("nemotron_official_metric", path)
+        if spec is None or spec.loader is None:
+            continue
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        extract_fn = getattr(module, "extract_prediction", None) or getattr(module, "extract_answer", None)
+        score_fn = getattr(module, "score_prediction", None) or getattr(module, "score", None)
+        if extract_fn is not None:
+            print(f"loaded official metric backend from: {path}")
+            return {"path": str(path), "extract_fn": extract_fn, "score_fn": score_fn}
+    print("official metric backend not found; fallback to local official_like extractor")
+    return None
+
+
+OFFICIAL_METRIC_BACKEND = load_official_metric_backend()
+
+
+def metric_extract_prediction(text: str) -> str:
+    if OFFICIAL_METRIC_BACKEND is not None:
+        return canonicalize_answer(OFFICIAL_METRIC_BACKEND["extract_fn"](text))
+    return official_like_extract_prediction(text)
+
+
 def approx_equal(pred: str, gold: str, rel_tol: float = cfg.numeric_rel_tol) -> bool:
     pred_c = canonicalize_answer(pred)
     gold_c = canonicalize_answer(gold)
+    if OFFICIAL_METRIC_BACKEND is not None and OFFICIAL_METRIC_BACKEND.get("score_fn") is not None:
+        return bool(OFFICIAL_METRIC_BACKEND["score_fn"](pred_c, gold_c))
     if pred_c == gold_c:
         return True
 
@@ -1181,7 +1229,7 @@ def evaluate_accuracy(
     df: pd.DataFrame,
     template_override: Optional[str] = None,
     max_new_tokens_grid: Sequence[int] = (64, 96),
-    extractor_fn=official_like_extract_prediction,
+    extractor_fn=metric_extract_prediction,
 ) -> Tuple[float, pd.DataFrame]:
     rows = []
     for row in df.itertuples(index=False):
@@ -1296,7 +1344,7 @@ def print_eval_summaries(pred_df: pd.DataFrame, prefix: str) -> None:
 def evaluate_multi_seed_views(
     model: torch.nn.Module,
     eval_views: Dict[int, pd.DataFrame],
-    extractor_fn=official_like_extract_prediction,
+    extractor_fn=metric_extract_prediction,
 ) -> pd.DataFrame:
     rows = []
     for seed, view_df in eval_views.items():
@@ -1337,7 +1385,7 @@ def run_serious_eval_suite(
     primary_df: pd.DataFrame,
     eval_views: Dict[int, pd.DataFrame],
     prefix: str,
-    extractor_fn=official_like_extract_prediction,
+    extractor_fn=metric_extract_prediction,
 ) -> Tuple[float, pd.DataFrame, pd.DataFrame]:
     primary_acc, primary_pred_df = evaluate_accuracy(model, primary_df, extractor_fn=extractor_fn)
     print(f"{prefix} serious accuracy: {primary_acc:.4f}")
@@ -1362,7 +1410,7 @@ def update_replay_buffer(
     return replay_buffer
 
 
-def run_template_ablation(model: torch.nn.Module, df: pd.DataFrame, max_rows: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def run_template_ablation(model: torch.nn.Module, df: pd.DataFrame, max_rows: int) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     eval_df = df.head(max_rows).copy()
     rows = []
     mapping_rows = []
@@ -1378,19 +1426,66 @@ def run_template_ablation(model: torch.nn.Module, df: pd.DataFrame, max_rows: in
             }
         )
         family_scores = (
-            pred_df.groupby("prompt_family")["hit"].mean().reset_index().rename(columns={"hit": "accuracy"})
+            pred_df.groupby("prompt_family")
+            .agg(accuracy=("hit", "mean"), family_rows=("hit", "size"))
+            .reset_index()
         )
         family_scores["template_id"] = template_id
         mapping_rows.append(family_scores)
     score_df = pd.DataFrame(rows).sort_values(["accuracy", "boxed_parse_rate", "has_boxed_rate"], ascending=False).reset_index(drop=True)
     mapping_df = pd.concat(mapping_rows, ignore_index=True)
     best_mapping = (
-        mapping_df.sort_values(["prompt_family", "accuracy"], ascending=[True, False])
+        mapping_df.sort_values(["prompt_family", "accuracy", "family_rows"], ascending=[True, False, False])
         .groupby("prompt_family", as_index=False)
         .first()
         .rename(columns={"template_id": "best_template_id", "accuracy": "best_accuracy"})
     )
-    return score_df, best_mapping
+    return score_df, best_mapping, mapping_df
+
+
+def apply_template_ablation_updates(
+    current_map: Dict[str, str],
+    best_mapping_df: pd.DataFrame,
+    full_mapping_df: pd.DataFrame,
+) -> pd.DataFrame:
+    decisions = []
+    updated_map = dict(current_map)
+    for row in best_mapping_df.itertuples(index=False):
+        family = row.prompt_family
+        new_template = row.best_template_id
+        new_acc = float(row.best_accuracy)
+        family_rows = int(row.family_rows)
+        old_template = current_map.get(family, FAMILY_TEMPLATE_PRIORS.get(family, "T2_compact"))
+        old_match = full_mapping_df.loc[
+            (full_mapping_df["prompt_family"] == family) & (full_mapping_df["template_id"] == old_template),
+            "accuracy",
+        ]
+        old_acc = float(old_match.iloc[0]) if len(old_match) else 0.0
+        gain = new_acc - old_acc
+        should_update = (
+            family_rows >= cfg.template_ablation_family_min_rows
+            and gain >= cfg.template_ablation_stage2_min_gain
+        )
+        if should_update:
+            updated_map[family] = new_template
+        decisions.append(
+            {
+                "prompt_family": family,
+                "family_rows": family_rows,
+                "old_template_id": old_template,
+                "old_accuracy": old_acc,
+                "candidate_template_id": new_template,
+                "candidate_accuracy": new_acc,
+                "gain": gain,
+                "min_gain": cfg.template_ablation_stage2_min_gain,
+                "min_rows": cfg.template_ablation_family_min_rows,
+                "updated": should_update,
+                "applied_template_id": updated_map.get(family, old_template),
+            }
+        )
+    BEST_TEMPLATE_BY_FAMILY.clear()
+    BEST_TEMPLATE_BY_FAMILY.update(updated_map)
+    return pd.DataFrame(decisions).sort_values(["updated", "gain", "family_rows"], ascending=[False, False, False]).reset_index(drop=True)
 
 
 @torch.no_grad()
@@ -1399,7 +1494,7 @@ def ensemble_predict(model: torch.nn.Module, prompt_text: str, template_ids: Seq
     raw_candidates = []
     for template_id in template_ids:
         raw = generate_answer_text(model, TEMPLATE_POOL[template_id](prompt_text))
-        pred = extract_prediction(raw)
+        pred = metric_extract_prediction(raw)
         votes.append(pred)
         raw_candidates.append({"template_id": template_id, "pred": pred, "raw": raw[:800]})
 
@@ -1435,21 +1530,43 @@ def evaluate_with_consensus(model: torch.nn.Module, df: pd.DataFrame, template_i
     return float(out["hit"].mean()) if len(out) else 0.0, out
 
 
+def pseudolabel_passes_family_filter(prompt_family: str, answer_type: str, pred: str) -> bool:
+    pred = canonicalize_answer(pred)
+    if prompt_family not in set(cfg.consensus_pseudolabel_allowed_families):
+        return False
+    if answer_type in {"numeric", "binary"}:
+        if answer_type == "binary":
+            return bool(BINARY_RE.fullmatch(pred))
+        return bool(ANSWER_NUMBER_RE.fullmatch(pred.replace(",", "")))
+    if prompt_family == "cipher_decrypt":
+        return bool(re.fullmatch(r"[A-Za-z][A-Za-z\- ]{0,47}", pred))
+    if answer_type in {"short_text", "multi_token_text"}:
+        return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9\-_, ]{0,63}", pred))
+    return False
+
+
 @torch.no_grad()
 def build_consensus_pseudolabels(model: torch.nn.Module, unlabeled_df: pd.DataFrame, template_ids: Sequence[str], max_rows: int = 128) -> pd.DataFrame:
     rows = []
     for row in unlabeled_df.head(max_rows).itertuples(index=False):
+        prompt_family = infer_prompt_family(row.prompt)
         result = ensemble_predict(model, row.prompt, template_ids=template_ids)
-        if result["votes"] == result["num_templates"]:
-            rows.append(
-                {
-                    "id": getattr(row, "id", f"pseudo_{len(rows)}"),
-                    "prompt": row.prompt,
-                    "answer": result["pred"],
-                    "source": "consensus_pseudolabel",
-                    "confidence": result["votes"] / result["num_templates"],
-                }
-            )
+        answer_type = infer_answer_type(result["pred"])
+        if result["votes"] != result["num_templates"]:
+            continue
+        if not pseudolabel_passes_family_filter(prompt_family, answer_type, result["pred"]):
+            continue
+        rows.append(
+            {
+                "id": getattr(row, "id", f"pseudo_{len(rows)}"),
+                "prompt": row.prompt,
+                "answer": result["pred"],
+                "source": f"consensus_pseudolabel::{prompt_family}",
+                "confidence": result["votes"] / result["num_templates"],
+                "prompt_family": prompt_family,
+                "answer_type": answer_type,
+            }
+        )
     return pd.DataFrame(rows)
 
 
@@ -1596,7 +1713,7 @@ def refresh_stage2_training_assets(
     return refreshed_train_records, refreshed_valid_records, stage2_variant_ref, valid_variant_ref, stage2_ds_ref, valid_ds_ref, stage2_weights_ref, stage2_records_ref
 
 
-def train_stage2_with_refresh(
+def train_stage2_with_reweight(
     model: torch.nn.Module,
     train_dataset: Dataset,
     eval_dataset: Dataset,
@@ -1729,8 +1846,11 @@ if cfg.run_supervision_ablation:
 else:
     print("skip full supervision ablation: set cfg.run_supervision_ablation=True to compare answer_only / short_reasoning / family_aware_mix side-by-side.")
 
+template_preview_df = build_seeded_family_balanced_subset(valid_fold, cfg.reasoning_template_eval_rows, seed=cfg.seed)
+print("template preview rows (reasoning_template_eval_rows):", template_preview_df.shape)
 template_score_df = pd.DataFrame()
-family_template_map_df = pd.DataFrame(columns=["prompt_family", "best_template_id", "best_accuracy"])
+family_template_map_df = pd.DataFrame(columns=["prompt_family", "best_template_id", "best_accuracy", "family_rows"])
+template_update_decisions_df = pd.DataFrame()
 
 # %% [markdown]
 # ## Cell 19 — Stage 1 训练（短 / 规则明显 family 先收敛）
@@ -1783,22 +1903,25 @@ replay_buffer = update_replay_buffer({}, stage1_train_probe_pred_df)
 print("bootstrapped replay buffer size:", len(replay_buffer))
 
 if cfg.enable_prompt_template_ablation:
+    template_eval_rows = max(cfg.reasoning_template_eval_rows, cfg.template_ablation_after_stage1_rows)
     template_eval_df = build_seeded_family_balanced_subset(
         valid_fold,
-        cfg.template_ablation_after_stage1_rows,
+        template_eval_rows,
         seed=cfg.seed,
     )
-    template_score_df, family_template_map_df = run_template_ablation(model, template_eval_df, cfg.template_ablation_after_stage1_rows)
-    candidate_template_map = dict(zip(family_template_map_df["prompt_family"], family_template_map_df["best_template_id"]))
-    updated_template_map = dict(BEST_TEMPLATE_BY_FAMILY)
-    for family, template_id in candidate_template_map.items():
-        updated_template_map[family] = template_id
-    BEST_TEMPLATE_BY_FAMILY.clear()
-    BEST_TEMPLATE_BY_FAMILY.update(updated_template_map)
+    template_score_df, family_template_map_df, family_template_full_df = run_template_ablation(model, template_eval_df, template_eval_rows)
+    template_update_decisions_df = apply_template_ablation_updates(
+        dict(BEST_TEMPLATE_BY_FAMILY),
+        family_template_map_df,
+        family_template_full_df,
+    )
     display(template_score_df)
     display(family_template_map_df.head(20))
+    display(template_update_decisions_df.head(20))
     template_score_df.to_csv(Path(cfg.work_dir) / "template_ablation_scores_stage1.csv", index=False)
     family_template_map_df.to_csv(Path(cfg.work_dir) / "family_template_map_stage1.csv", index=False)
+    family_template_full_df.to_csv(Path(cfg.work_dir) / "family_template_full_stage1.csv", index=False)
+    template_update_decisions_df.to_csv(Path(cfg.work_dir) / "family_template_update_decisions_stage1.csv", index=False)
 
 train_records, valid_records, stage2_variant_ds, valid_variant_ds, stage2_ds, valid_ds, stage2_weights, stage2_records = refresh_stage2_training_assets(
     train_fold,
@@ -1815,10 +1938,10 @@ hard_profile = build_hard_profile(stage1_pred_df)
 stage2_weights = compute_sample_weights(stage2_records, hard_profile=hard_profile, replay_buffer=replay_buffer)
 print("stage2 weight summary after hard profile + replay bootstrap:", np.quantile(stage2_weights, [0, 0.25, 0.5, 0.75, 1]))
 # %% [markdown]
-# ## Cell 21 — Stage 2 训练（多轮错题驱动重加权）
+# ## Cell 21 — Stage 2 训练（多轮重加权，而非轮间重建数据资产）
 
 # %%
-model, stage2_last_pred_df, replay_buffer = train_stage2_with_refresh(
+model, stage2_last_pred_df, replay_buffer = train_stage2_with_reweight(
     model=model,
     train_dataset=stage2_ds,
     eval_dataset=valid_ds,
@@ -1896,7 +2019,7 @@ smoke_rows = []
 for row in smoke_df.itertuples(index=False):
     _template_id, prompt_text = choose_template(row.prompt, "numeric", infer_prompt_family(row.prompt))
     raw = generate_answer_text(model, prompt_text)
-    pred = extract_prediction(raw)
+    pred = metric_extract_prediction(raw)
     smoke_rows.append({"id": row.id, "pred": pred, "raw": raw[:1000]})
 smoke_pred_df = pd.DataFrame(smoke_rows)
 display(smoke_pred_df)
