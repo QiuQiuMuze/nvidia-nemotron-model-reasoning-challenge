@@ -62,7 +62,7 @@ import zipfile
 from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -154,7 +154,7 @@ class CFG:
     reasoning_template_eval_rows: int = 48
     enable_consensus_pseudolabel_refresh: bool = True
     consensus_pseudolabel_max_rows: int = 192
-    consensus_pseudolabel_allowed_families: Tuple[str, ...] = ("bit_transform", "sequence", "fewshot_pattern", "matrix_reasoning", "cipher_decrypt")
+    consensus_pseudolabel_allowed_families: Tuple[str, ...] = ("bit_transform", "sequence", "matrix_reasoning")
     consensus_template_ids: Tuple[str, ...] = (
         "T1_ultra_compact",
         "T3_hidden_reasoning",
@@ -164,6 +164,10 @@ class CFG:
     template_ablation_after_stage1_rows: int = 128
     template_ablation_stage2_min_gain: float = 0.02
     template_ablation_family_min_rows: int = 10
+    template_ablation_require_non_worse_boxed_metrics: bool = True
+    template_ablation_secondary_seed: int = 97
+    stage2_asset_refresh_interval_rounds: int = 2
+    stage2_refresh_template_eval_rows: int = 96
     fixed_sanity_rows: int = 64
     stage1_family_frequency_quantile: float = 0.55
     hard_mining_family_boost: float = 0.35
@@ -1427,7 +1431,12 @@ def run_template_ablation(model: torch.nn.Module, df: pd.DataFrame, max_rows: in
         )
         family_scores = (
             pred_df.groupby("prompt_family")
-            .agg(accuracy=("hit", "mean"), family_rows=("hit", "size"))
+            .agg(
+                accuracy=("hit", "mean"),
+                family_rows=("hit", "size"),
+                has_boxed_rate=("has_boxed", "mean"),
+                boxed_parse_rate=("boxed_parsed_success", "mean"),
+            )
             .reset_index()
         )
         family_scores["template_id"] = template_id
@@ -1443,28 +1452,66 @@ def run_template_ablation(model: torch.nn.Module, df: pd.DataFrame, max_rows: in
     return score_df, best_mapping, mapping_df
 
 
+def lookup_template_family_metrics(mapping_df: Optional[pd.DataFrame], family: str, template_id: str) -> Dict[str, float]:
+    if mapping_df is None or mapping_df.empty:
+        return {
+            "accuracy": 0.0,
+            "family_rows": 0.0,
+            "has_boxed_rate": 0.0,
+            "boxed_parse_rate": 0.0,
+        }
+    match = mapping_df.loc[
+        (mapping_df["prompt_family"] == family) & (mapping_df["template_id"] == template_id)
+    ]
+    if match.empty:
+        return {
+            "accuracy": 0.0,
+            "family_rows": 0.0,
+            "has_boxed_rate": 0.0,
+            "boxed_parse_rate": 0.0,
+        }
+    row = match.iloc[0]
+    return {
+        "accuracy": float(row.get("accuracy", 0.0)),
+        "family_rows": float(row.get("family_rows", 0.0)),
+        "has_boxed_rate": float(row.get("has_boxed_rate", 0.0)),
+        "boxed_parse_rate": float(row.get("boxed_parse_rate", 0.0)),
+    }
+
+
 def apply_template_ablation_updates(
     current_map: Dict[str, str],
     best_mapping_df: pd.DataFrame,
     full_mapping_df: pd.DataFrame,
+    secondary_mapping_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     decisions = []
     updated_map = dict(current_map)
     for row in best_mapping_df.itertuples(index=False):
         family = row.prompt_family
         new_template = row.best_template_id
-        new_acc = float(row.best_accuracy)
         family_rows = int(row.family_rows)
         old_template = current_map.get(family, FAMILY_TEMPLATE_PRIORS.get(family, "T2_compact"))
-        old_match = full_mapping_df.loc[
-            (full_mapping_df["prompt_family"] == family) & (full_mapping_df["template_id"] == old_template),
-            "accuracy",
-        ]
-        old_acc = float(old_match.iloc[0]) if len(old_match) else 0.0
-        gain = new_acc - old_acc
+
+        old_metrics = lookup_template_family_metrics(full_mapping_df, family, old_template)
+        new_metrics = lookup_template_family_metrics(full_mapping_df, family, new_template)
+        gain = new_metrics["accuracy"] - old_metrics["accuracy"]
+        boxed_ok = (
+            not cfg.template_ablation_require_non_worse_boxed_metrics
+            or (
+                new_metrics["has_boxed_rate"] >= old_metrics["has_boxed_rate"]
+                and new_metrics["boxed_parse_rate"] >= old_metrics["boxed_parse_rate"]
+            )
+        )
+
+        secondary_old_metrics = lookup_template_family_metrics(secondary_mapping_df, family, old_template) if secondary_mapping_df is not None else old_metrics
+        secondary_new_metrics = lookup_template_family_metrics(secondary_mapping_df, family, new_template) if secondary_mapping_df is not None else new_metrics
+        passed_multi_view_check = secondary_new_metrics["accuracy"] >= secondary_old_metrics["accuracy"]
         should_update = (
             family_rows >= cfg.template_ablation_family_min_rows
             and gain >= cfg.template_ablation_stage2_min_gain
+            and boxed_ok
+            and passed_multi_view_check
         )
         if should_update:
             updated_map[family] = new_template
@@ -1473,10 +1520,18 @@ def apply_template_ablation_updates(
                 "prompt_family": family,
                 "family_rows": family_rows,
                 "old_template_id": old_template,
-                "old_accuracy": old_acc,
+                "old_accuracy": old_metrics["accuracy"],
+                "old_has_boxed_rate": old_metrics["has_boxed_rate"],
+                "old_boxed_parse_rate": old_metrics["boxed_parse_rate"],
                 "candidate_template_id": new_template,
-                "candidate_accuracy": new_acc,
+                "candidate_accuracy": new_metrics["accuracy"],
+                "candidate_has_boxed_rate": new_metrics["has_boxed_rate"],
+                "candidate_boxed_parse_rate": new_metrics["boxed_parse_rate"],
                 "gain": gain,
+                "secondary_old_accuracy": secondary_old_metrics["accuracy"],
+                "secondary_candidate_accuracy": secondary_new_metrics["accuracy"],
+                "boxed_ok": boxed_ok,
+                "passed_multi_view_check": passed_multi_view_check,
                 "min_gain": cfg.template_ablation_stage2_min_gain,
                 "min_rows": cfg.template_ablation_family_min_rows,
                 "updated": should_update,
@@ -1534,14 +1589,16 @@ def pseudolabel_passes_family_filter(prompt_family: str, answer_type: str, pred:
     pred = canonicalize_answer(pred)
     if prompt_family not in set(cfg.consensus_pseudolabel_allowed_families):
         return False
-    if answer_type in {"numeric", "binary"}:
-        if answer_type == "binary":
-            return bool(BINARY_RE.fullmatch(pred))
+    if answer_type == "multi_token_text":
+        return False
+    if answer_type == "binary":
+        return bool(BINARY_RE.fullmatch(pred))
+    if answer_type == "numeric":
         return bool(ANSWER_NUMBER_RE.fullmatch(pred.replace(",", "")))
-    if prompt_family == "cipher_decrypt":
-        return bool(re.fullmatch(r"[A-Za-z][A-Za-z\- ]{0,47}", pred))
-    if answer_type in {"short_text", "multi_token_text"}:
-        return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9\-_, ]{0,63}", pred))
+    if prompt_family == "bit_transform":
+        return bool(BINARY_RE.fullmatch(pred))
+    if prompt_family in {"sequence", "matrix_reasoning"}:
+        return bool(ANSWER_NUMBER_RE.fullmatch(pred.replace(",", "")) or re.fullmatch(r"[A-Za-z0-9]{1,16}", pred))
     return False
 
 
@@ -1713,6 +1770,62 @@ def refresh_stage2_training_assets(
     return refreshed_train_records, refreshed_valid_records, stage2_variant_ref, valid_variant_ref, stage2_ds_ref, valid_ds_ref, stage2_weights_ref, stage2_records_ref
 
 
+def perform_conservative_template_refresh(
+    model: torch.nn.Module,
+    eval_df_primary: pd.DataFrame,
+    eval_df_secondary: pd.DataFrame,
+    prefix: str,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    template_score_df, family_template_map_df, family_template_full_df = run_template_ablation(
+        model,
+        eval_df_primary,
+        len(eval_df_primary),
+    )
+    _secondary_score_df, _secondary_best_df, family_template_secondary_df = run_template_ablation(
+        model,
+        eval_df_secondary,
+        len(eval_df_secondary),
+    )
+    template_update_decisions_df = apply_template_ablation_updates(
+        dict(BEST_TEMPLATE_BY_FAMILY),
+        family_template_map_df,
+        family_template_full_df,
+        secondary_mapping_df=family_template_secondary_df,
+    )
+    template_score_df.to_csv(Path(cfg.work_dir) / f"{prefix}_template_ablation_scores.csv", index=False)
+    family_template_map_df.to_csv(Path(cfg.work_dir) / f"{prefix}_family_template_map.csv", index=False)
+    family_template_full_df.to_csv(Path(cfg.work_dir) / f"{prefix}_family_template_full.csv", index=False)
+    template_update_decisions_df.to_csv(Path(cfg.work_dir) / f"{prefix}_family_template_update_decisions.csv", index=False)
+    return template_score_df, family_template_map_df, family_template_full_df, template_update_decisions_df
+
+
+def maybe_refresh_stage2_assets(
+    model: torch.nn.Module,
+    round_idx: int,
+    replay_buffer: Dict[str, int],
+    hard_profile: Dict[str, Dict[str, float]],
+    refresh_assets_fn: Optional[Callable[[torch.nn.Module, int], Optional[Dict[str, Any]]]] = None,
+) -> Optional[Dict[str, Any]]:
+    if refresh_assets_fn is None:
+        return None
+    if cfg.stage2_asset_refresh_interval_rounds <= 0:
+        return None
+    round_number = round_idx + 1
+    if round_number >= cfg.stage2_rounds:
+        return None
+    if round_number % cfg.stage2_asset_refresh_interval_rounds != 0:
+        return None
+    refreshed = refresh_assets_fn(model, round_number)
+    if refreshed is None:
+        return None
+    refreshed["sample_weights"] = compute_sample_weights(
+        refreshed["train_records_df"],
+        hard_profile=hard_profile,
+        replay_buffer=replay_buffer,
+    )
+    return refreshed
+
+
 def train_stage2_with_reweight(
     model: torch.nn.Module,
     train_dataset: Dataset,
@@ -1720,6 +1833,7 @@ def train_stage2_with_reweight(
     train_records_df: pd.DataFrame,
     initial_weights: np.ndarray,
     replay_buffer: Optional[Dict[str, int]] = None,
+    refresh_assets_fn: Optional[Callable[[torch.nn.Module, int], Optional[Dict[str, Any]]]] = None,
 ) -> Tuple[torch.nn.Module, pd.DataFrame, Dict[str, int]]:
     current_weights = initial_weights
     last_pred_df = pd.DataFrame()
@@ -1752,6 +1866,19 @@ def train_stage2_with_reweight(
         replay_buffer = update_replay_buffer(replay_buffer, replay_probe_pred_df)
         current_weights = compute_sample_weights(train_records_df, hard_profile=hard_profile, replay_buffer=replay_buffer)
         print(f"replay probe accuracy round {round_idx + 1}: {probe_acc:.4f}; replay buffer size={len(replay_buffer)}")
+        refreshed_assets = maybe_refresh_stage2_assets(
+            model,
+            round_idx,
+            replay_buffer,
+            hard_profile,
+            refresh_assets_fn=refresh_assets_fn,
+        )
+        if refreshed_assets is not None:
+            train_dataset = refreshed_assets["train_dataset"]
+            eval_dataset = refreshed_assets["eval_dataset"]
+            train_records_df = refreshed_assets["train_records_df"]
+            current_weights = refreshed_assets["sample_weights"]
+            print(f"stage2 assets refreshed after round {round_idx + 1}; new train rows={len(train_records_df)}")
         print(
             f"refreshed weights after round {round_idx + 1}:",
             np.quantile(current_weights, [0, 0.25, 0.5, 0.75, 1]),
@@ -1909,19 +2036,20 @@ if cfg.enable_prompt_template_ablation:
         template_eval_rows,
         seed=cfg.seed,
     )
-    template_score_df, family_template_map_df, family_template_full_df = run_template_ablation(model, template_eval_df, template_eval_rows)
-    template_update_decisions_df = apply_template_ablation_updates(
-        dict(BEST_TEMPLATE_BY_FAMILY),
-        family_template_map_df,
-        family_template_full_df,
+    template_secondary_eval_df = build_seeded_family_balanced_subset(
+        valid_fold,
+        template_eval_rows,
+        seed=cfg.template_ablation_secondary_seed,
+    )
+    template_score_df, family_template_map_df, family_template_full_df, template_update_decisions_df = perform_conservative_template_refresh(
+        model,
+        template_eval_df,
+        template_secondary_eval_df,
+        prefix="stage1",
     )
     display(template_score_df)
     display(family_template_map_df.head(20))
     display(template_update_decisions_df.head(20))
-    template_score_df.to_csv(Path(cfg.work_dir) / "template_ablation_scores_stage1.csv", index=False)
-    family_template_map_df.to_csv(Path(cfg.work_dir) / "family_template_map_stage1.csv", index=False)
-    family_template_full_df.to_csv(Path(cfg.work_dir) / "family_template_full_stage1.csv", index=False)
-    template_update_decisions_df.to_csv(Path(cfg.work_dir) / "family_template_update_decisions_stage1.csv", index=False)
 
 train_records, valid_records, stage2_variant_ds, valid_variant_ds, stage2_ds, valid_ds, stage2_weights, stage2_records = refresh_stage2_training_assets(
     train_fold,
@@ -1941,6 +2069,42 @@ print("stage2 weight summary after hard profile + replay bootstrap:", np.quantil
 # ## Cell 21 — Stage 2 训练（多轮重加权，而非轮间重建数据资产）
 
 # %%
+def refresh_stage2_assets_for_round(current_model: torch.nn.Module, completed_round: int) -> Optional[Dict[str, Any]]:
+    if cfg.enable_prompt_template_ablation:
+        round_eval_df = build_seeded_family_balanced_subset(
+            valid_fold,
+            cfg.stage2_refresh_template_eval_rows,
+            seed=cfg.seed + completed_round,
+        )
+        round_secondary_eval_df = build_seeded_family_balanced_subset(
+            valid_fold,
+            cfg.stage2_refresh_template_eval_rows,
+            seed=cfg.template_ablation_secondary_seed + completed_round,
+        )
+        _score_df, _map_df, _full_df, round_decisions_df = perform_conservative_template_refresh(
+            current_model,
+            round_eval_df,
+            round_secondary_eval_df,
+            prefix=f"stage2_round_{completed_round}",
+        )
+        display(round_decisions_df.head(12))
+
+    refreshed_train_records, refreshed_valid_records, refreshed_stage2_variant_ds, refreshed_valid_variant_ds, refreshed_stage2_ds, refreshed_valid_ds, refreshed_stage2_weights, refreshed_stage2_records = refresh_stage2_training_assets(
+        train_fold,
+        valid_fold,
+        stage1_records,
+        current_model=current_model,
+        unlabeled_df=unlabeled_external_df,
+    )
+    return {
+        "train_records_df": refreshed_stage2_records,
+        "train_dataset": refreshed_stage2_ds,
+        "eval_dataset": refreshed_valid_ds,
+        "valid_records_df": refreshed_valid_records,
+        "sample_weights": refreshed_stage2_weights,
+    }
+
+
 model, stage2_last_pred_df, replay_buffer = train_stage2_with_reweight(
     model=model,
     train_dataset=stage2_ds,
@@ -1948,6 +2112,7 @@ model, stage2_last_pred_df, replay_buffer = train_stage2_with_reweight(
     train_records_df=stage2_records,
     initial_weights=stage2_weights,
     replay_buffer=replay_buffer,
+    refresh_assets_fn=refresh_stage2_assets_for_round,
 )
 
 # %% [markdown]
