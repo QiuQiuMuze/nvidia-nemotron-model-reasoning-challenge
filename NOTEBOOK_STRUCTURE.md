@@ -26,6 +26,7 @@
    - 先显式规则分组，再对剩余模板做规范化指纹分组。
 7. **Cell 7: 近似官方 metric**
    - `\boxed{}` 提取、`1e-2` 数值容差、回退 heuristic 尽量贴近官方。
+   - 保留 fast extractor，同时 serious eval 走更 strict 的 official-like extractor。
 
 ### Part C — Prompt and supervision design
 8. **Cell 8: Prompt 模板池**
@@ -50,9 +51,11 @@
 19. **Cell 19: Stage 1 训练**
 20. **Cell 20: 动态 hard mining**
    - 每轮 eval 后，按错题统计更新下一轮采样权重。
+   - 增加 sample-level replay buffer，而不是只看 group 均值。
 21. **Cell 21: Stage 2 多轮训练**
 22. **Cell 22: 分组近似评估**
    - 增加 test-time template consensus 对照。
+   - 把 consensus 更多当成伪标签/脆弱 family 发现工具，而不是最终提交流程本身。
 
 ### Part E — Submission packaging
 23. **Cell 23: 保存 adapter + 校验 rank**
@@ -69,6 +72,7 @@
 - **更贴合评分方式**：训练目标直接对齐 boxed final answer，而不是泛化不清的长文本输出。
 - **更贴合真实泛化**：显式规则 + 模板指纹分组，比纯手工 family split 更稳。
 - **更利于冲榜迭代**：外挂数据、A/B supervision、template pool、动态错题驱动重加权、stage curriculum 都有现成扩展位。
+- **更利于数据增益**：consensus 可以反过来做高置信伪标签筛选和脆弱 family 发现。
 - **更利于离线判断**：fast eval 看趋势，serious eval 做最终方案选择。
 - **更利于路线判断**：可以先用小规模对照实验判断 supervision 该走 `answer_only` 还是 `short_reasoning`。
 - **更利于公开复现**：每个 cell 都有清晰职责，方便你做 Kaggle write-up 和公开 Notebook 注释。

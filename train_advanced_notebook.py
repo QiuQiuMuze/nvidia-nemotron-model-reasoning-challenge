@@ -126,6 +126,7 @@ class CFG:
     valid_size: float = 0.08
     fast_eval_examples: int = 96
     serious_eval_examples: int = 256
+    serious_eval_seeds: Tuple[int, ...] = (11, 23, 47)
     numeric_rel_tol: float = 1e-2
 
     # ===== curriculum =====
@@ -154,6 +155,8 @@ class CFG:
     hard_mining_template_group_boost: float = 0.20
     hard_mining_answer_type_boost: float = 0.20
     hard_mining_bucket_boost: float = 0.15
+    hard_mining_sample_boost: float = 0.60
+    replay_probe_rows: int = 128
     allow_target_auto_discovery: bool = False
     target_modules_final: Tuple[str, ...] = (
         "q_proj",
@@ -414,11 +417,16 @@ def boxed(ans: Any) -> str:
     return clean if clean.startswith("\\boxed{") else f"\\boxed{{{clean}}}"
 
 
-def extract_prediction(text: str) -> str:
+def extract_boxed(text: str) -> Optional[str]:
     text = str(text).strip()
     boxed_hits = BOXED_RE.findall(text)
     if boxed_hits:
         return canonicalize_answer(boxed_hits[-1])
+    return None
+
+
+def extract_final_answer_pattern(text: str) -> Optional[str]:
+    text = str(text).strip()
 
     for pattern in FINAL_ANSWER_PATTERNS:
         hits = pattern.findall(text)
@@ -429,7 +437,11 @@ def extract_prediction(text: str) -> str:
             candidate = re.sub(r"^[=:：-]\s*", "", candidate)
             if candidate:
                 return canonicalize_answer(candidate)
+    return None
 
+
+def extract_other_heuristics(text: str) -> Optional[str]:
+    text = str(text).strip()
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if lines:
         last_line = re.sub(r"^\$|\$$", "", lines[-1]).strip()
@@ -438,12 +450,37 @@ def extract_prediction(text: str) -> str:
                 return canonicalize_answer(last_line)
             if len(last_line) <= 128:
                 return canonicalize_answer(last_line)
+    return None
 
+
+def extract_last_numeric(text: str) -> Optional[str]:
+    text = str(text).strip()
     last_num_hits = LAST_NUMBER_RE.findall(text.replace(",", ""))
     if last_num_hits:
         return canonicalize_answer(last_num_hits[-1])
+    return None
 
+
+def fast_extract_prediction(text: str) -> str:
+    for fn in (extract_boxed, extract_last_numeric, extract_other_heuristics):
+        result = fn(text)
+        if result is not None:
+            return result
+    lines = [line.strip() for line in str(text).splitlines() if line.strip()]
     return canonicalize_answer(lines[-1] if lines else text)
+
+
+def official_like_extract_prediction(text: str) -> str:
+    for fn in (extract_boxed, extract_final_answer_pattern, extract_other_heuristics, extract_last_numeric):
+        result = fn(text)
+        if result is not None:
+            return result
+    lines = [line.strip() for line in str(text).splitlines() if line.strip()]
+    return canonicalize_answer(lines[-1] if lines else text)
+
+
+def extract_prediction(text: str) -> str:
+    return official_like_extract_prediction(text)
 
 
 def approx_equal(pred: str, gold: str, rel_tol: float = cfg.numeric_rel_tol) -> bool:
@@ -900,7 +937,11 @@ model.print_trainable_parameters()
 
 # %%
 
-def compute_sample_weights(df_like: pd.DataFrame, hard_profile: Optional[Dict[str, Dict[str, float]]] = None) -> np.ndarray:
+def compute_sample_weights(
+    df_like: pd.DataFrame,
+    hard_profile: Optional[Dict[str, Dict[str, float]]] = None,
+    replay_buffer: Optional[Dict[str, int]] = None,
+) -> np.ndarray:
     family_counts = df_like["prompt_family"].value_counts().to_dict()
     bucket_counts = df_like["len_bucket"].value_counts().to_dict()
     weights = []
@@ -918,6 +959,8 @@ def compute_sample_weights(df_like: pd.DataFrame, hard_profile: Optional[Dict[st
             weight *= 1.0 + cfg.hard_mining_template_group_boost * hard_profile["template_group"].get(row.template_group, 0.0)
             weight *= 1.0 + cfg.hard_mining_answer_type_boost * hard_profile["answer_type"].get(row.answer_type, 0.0)
             weight *= 1.0 + cfg.hard_mining_bucket_boost * hard_profile["len_bucket"].get(row.len_bucket, 0.0)
+        if replay_buffer is not None:
+            weight *= 1.0 + cfg.hard_mining_sample_boost * replay_buffer.get(row.id, 0)
         weights.append(weight)
 
     arr = np.asarray(weights, dtype=np.float64)
@@ -991,12 +1034,36 @@ def build_fixed_sanity_subset(df: pd.DataFrame, max_rows: int) -> pd.DataFrame:
     return out
 
 
+def build_seeded_family_balanced_subset(df: pd.DataFrame, max_rows: int, seed: int) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    sampled = []
+    groups = max(df["prompt_family"].nunique(), 1)
+    per_family = max(1, max_rows // groups)
+    for _family, block in df.groupby("prompt_family", sort=True):
+        if len(block) <= per_family:
+            sampled.append(block)
+        else:
+            sampled.append(block.sample(n=per_family, random_state=seed))
+    out = pd.concat(sampled, ignore_index=True)
+    if len(out) > max_rows:
+        keep_idx = rng.choice(len(out), size=max_rows, replace=False)
+        out = out.iloc[np.sort(keep_idx)].reset_index(drop=True)
+    return out
+
+
 fast_eval_df = stratified_valid_subset(valid_fold, cfg.fast_eval_examples)
 serious_eval_df = stratified_valid_subset(valid_fold, cfg.serious_eval_examples)
+serious_eval_views = {
+    seed: build_seeded_family_balanced_subset(valid_fold, cfg.serious_eval_examples, seed=seed)
+    for seed in cfg.serious_eval_seeds
+}
 fixed_sanity_df = build_fixed_sanity_subset(valid_fold, cfg.fixed_sanity_rows)
+train_replay_probe_df = build_fixed_sanity_subset(train_fold, cfg.replay_probe_rows)
 print("fast eval subset:", fast_eval_df.shape)
 print("serious eval subset:", serious_eval_df.shape)
+print("serious eval view seeds:", {seed: df.shape for seed, df in serious_eval_views.items()})
 print("fixed sanity subset:", fixed_sanity_df.shape)
+print("train replay probe subset:", train_replay_probe_df.shape)
 
 
 @torch.no_grad()
@@ -1019,6 +1086,7 @@ def evaluate_accuracy(
     df: pd.DataFrame,
     template_override: Optional[str] = None,
     max_new_tokens_grid: Sequence[int] = (64, 96),
+    extractor_fn=official_like_extract_prediction,
 ) -> Tuple[float, pd.DataFrame]:
     rows = []
     for row in df.itertuples(index=False):
@@ -1036,7 +1104,7 @@ def evaluate_accuracy(
         for max_new_tokens in max_new_tokens_grid:
             raw = generate_answer_text(model, prompt, max_new_tokens=max_new_tokens)
             boxed_matches = BOXED_RE.findall(raw)
-            pred = extract_prediction(raw)
+            pred = extractor_fn(raw)
             if "\\boxed{" in raw:
                 candidate_raw = raw
                 candidate_pred = pred
@@ -1049,6 +1117,20 @@ def evaluate_accuracy(
                 boxed_parsed_success = bool(boxed_matches)
 
         gold = canonicalize_answer(row.answer)
+        if approx_equal(candidate_pred, gold):
+            failure_type = "correct"
+        elif not boxed_hit:
+            failure_type = "missing_boxed"
+        elif answer_type in {"numeric", "binary"}:
+            pred_num = candidate_pred.replace(",", "")
+            gold_num = gold.replace(",", "")
+            if ANSWER_NUMBER_RE.fullmatch(pred_num) and ANSWER_NUMBER_RE.fullmatch(gold_num):
+                rel_err = abs(float(pred_num) - float(gold_num)) / max(abs(float(gold_num)), 1e-12)
+                failure_type = "wrong_numeric_close" if rel_err <= 0.05 else "wrong_numeric_far"
+            else:
+                failure_type = "extraction_mismatch"
+        else:
+            failure_type = "wrong_text"
         rows.append(
             {
                 "id": row.id,
@@ -1068,6 +1150,7 @@ def evaluate_accuracy(
                 "hit": approx_equal(candidate_pred, gold),
                 "has_boxed": boxed_hit,
                 "boxed_parsed_success": boxed_parsed_success,
+                "failure_type": failure_type,
                 "raw": candidate_raw[:1200],
             }
         )
@@ -1089,7 +1172,7 @@ def summarize_eval_metrics(pred_df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
             ]
         )
     }
-    for column in ["prompt_family", "template_group", "answer_type", "len_bucket", "source", "template_id"]:
+    for column in ["prompt_family", "template_group", "answer_type", "len_bucket", "source", "template_id", "failure_type"]:
         group_df = (
             pred_df.groupby(column, dropna=False)
             .agg(
@@ -1109,9 +1192,40 @@ def print_eval_summaries(pred_df: pd.DataFrame, prefix: str) -> None:
     summaries = summarize_eval_metrics(pred_df)
     print(f"\n[{prefix}] overall")
     display(summaries["overall"])
-    for column in ["prompt_family", "template_group", "answer_type", "len_bucket", "source", "template_id"]:
+    for column in ["prompt_family", "template_group", "answer_type", "len_bucket", "source", "template_id", "failure_type"]:
         print(f"\n[{prefix}] grouped by {column}")
         display(summaries[column].head(12))
+
+
+@torch.no_grad()
+def evaluate_multi_seed_views(
+    model: torch.nn.Module,
+    eval_views: Dict[int, pd.DataFrame],
+    extractor_fn=official_like_extract_prediction,
+) -> pd.DataFrame:
+    rows = []
+    for seed, view_df in eval_views.items():
+        acc, pred_df = evaluate_accuracy(model, view_df, extractor_fn=extractor_fn)
+        rows.append(
+            {
+                "seed": seed,
+                "rows": len(view_df),
+                "accuracy": acc,
+                "has_boxed_rate": pred_df["has_boxed"].mean(),
+                "boxed_parse_rate": pred_df["boxed_parsed_success"].mean(),
+            }
+        )
+    out = pd.DataFrame(rows)
+    summary = {
+        "seed": "mean±std",
+        "rows": out["rows"].mean(),
+        "accuracy": out["accuracy"].mean(),
+        "has_boxed_rate": out["has_boxed_rate"].mean(),
+        "boxed_parse_rate": out["boxed_parse_rate"].mean(),
+    }
+    summary["accuracy_std"] = out["accuracy"].std(ddof=0)
+    out = pd.concat([out, pd.DataFrame([summary])], ignore_index=True)
+    return out
 
 
 def build_hard_profile(pred_df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
@@ -1121,6 +1235,19 @@ def build_hard_profile(pred_df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
         "answer_type": (1.0 - pred_df.groupby("answer_type")["hit"].mean()).to_dict(),
         "len_bucket": (1.0 - pred_df.groupby("len_bucket")["hit"].mean()).to_dict(),
     }
+
+
+def update_replay_buffer(
+    replay_buffer: Dict[str, int],
+    pred_df: pd.DataFrame,
+    max_size: int = 512,
+) -> Dict[str, int]:
+    failure_rows = pred_df.loc[~pred_df["hit"], ["id", "failure_type"]].copy()
+    for row in failure_rows.itertuples(index=False):
+        replay_buffer[row.id] = replay_buffer.get(row.id, 0) + 1
+    if len(replay_buffer) > max_size:
+        replay_buffer = dict(sorted(replay_buffer.items(), key=lambda x: x[1], reverse=True)[:max_size])
+    return replay_buffer
 
 
 def run_template_ablation(model: torch.nn.Module, df: pd.DataFrame, max_rows: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -1196,14 +1323,57 @@ def evaluate_with_consensus(model: torch.nn.Module, df: pd.DataFrame, template_i
     return float(out["hit"].mean()) if len(out) else 0.0, out
 
 
+@torch.no_grad()
+def build_consensus_pseudolabels(model: torch.nn.Module, unlabeled_df: pd.DataFrame, template_ids: Sequence[str], max_rows: int = 128) -> pd.DataFrame:
+    rows = []
+    for row in unlabeled_df.head(max_rows).itertuples(index=False):
+        result = ensemble_predict(model, row.prompt, template_ids=template_ids)
+        if result["votes"] == result["num_templates"]:
+            rows.append(
+                {
+                    "id": getattr(row, "id", f"pseudo_{len(rows)}"),
+                    "prompt": row.prompt,
+                    "answer": result["pred"],
+                    "source": "consensus_pseudolabel",
+                    "confidence": result["votes"] / result["num_templates"],
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+@torch.no_grad()
+def summarize_template_disagreement(model: torch.nn.Module, df: pd.DataFrame, template_ids: Sequence[str], max_rows: int = 128) -> pd.DataFrame:
+    rows = []
+    for row in df.head(max_rows).itertuples(index=False):
+        result = ensemble_predict(model, row.prompt, template_ids=template_ids)
+        disagreement = 1.0 - (result["votes"] / result["num_templates"])
+        rows.append(
+            {
+                "id": row.id,
+                "prompt_family": infer_prompt_family(row.prompt),
+                "answer_type": infer_answer_type(getattr(row, "answer", "")),
+                "disagreement": disagreement,
+            }
+        )
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return (
+        out.groupby("prompt_family", as_index=False)
+        .agg(samples=("id", "size"), mean_disagreement=("disagreement", "mean"))
+        .sort_values(["mean_disagreement", "samples"], ascending=[False, False])
+    )
+
+
 class LocalAccuracyCallback(TrainerCallback):
-    def __init__(self, eval_df: pd.DataFrame, save_path: str):
+    def __init__(self, eval_df: pd.DataFrame, save_path: str, extractor_fn=fast_extract_prediction):
         self.eval_df = eval_df
         self.save_path = save_path
+        self.extractor_fn = extractor_fn
         self.history: List[Dict[str, Any]] = []
 
     def on_evaluate(self, args, state, control, model=None, **kwargs):
-        acc, pred_df = evaluate_accuracy(model, self.eval_df)
+        acc, pred_df = evaluate_accuracy(model, self.eval_df, extractor_fn=self.extractor_fn)
         record = {"step": int(state.global_step), "local_accuracy": acc}
         self.history.append(record)
         pd.DataFrame(self.history).to_csv(self.save_path, index=False)
@@ -1266,6 +1436,7 @@ def train_stage2_with_refresh(
 ) -> Tuple[torch.nn.Module, pd.DataFrame]:
     current_weights = initial_weights
     last_pred_df = pd.DataFrame()
+    replay_buffer: Dict[str, int] = {}
     per_round_epochs = cfg.stage2_epochs / max(cfg.stage2_rounds, 1)
 
     for round_idx in range(cfg.stage2_rounds):
@@ -1287,7 +1458,11 @@ def train_stage2_with_refresh(
         last_pred_df.to_csv(Path(cfg.work_dir) / f"stage2_round_{round_idx + 1}_predictions.csv", index=False)
 
         hard_profile = build_hard_profile(last_pred_df)
-        current_weights = compute_sample_weights(train_records_df, hard_profile=hard_profile)
+        probe_acc, replay_probe_pred_df = evaluate_accuracy(model, train_replay_probe_df, extractor_fn=fast_extract_prediction)
+        replay_probe_pred_df.to_csv(Path(cfg.work_dir) / f"stage2_round_{round_idx + 1}_train_probe_predictions.csv", index=False)
+        replay_buffer = update_replay_buffer(replay_buffer, replay_probe_pred_df)
+        current_weights = compute_sample_weights(train_records_df, hard_profile=hard_profile, replay_buffer=replay_buffer)
+        print(f"replay probe accuracy round {round_idx + 1}: {probe_acc:.4f}; replay buffer size={len(replay_buffer)}")
         print(
             f"refreshed weights after round {round_idx + 1}:",
             np.quantile(current_weights, [0, 0.25, 0.5, 0.75, 1]),
@@ -1424,6 +1599,9 @@ stage1_acc, stage1_pred_df = evaluate_accuracy(model, serious_eval_df)
 print(f"stage1 approx accuracy: {stage1_acc:.4f}")
 print_eval_summaries(stage1_pred_df, prefix="stage1-valid")
 stage1_pred_df.to_csv(Path(cfg.work_dir) / "stage1_valid_predictions.csv", index=False)
+stage1_multi_seed_df = evaluate_multi_seed_views(model, serious_eval_views)
+display(stage1_multi_seed_df)
+stage1_multi_seed_df.to_csv(Path(cfg.work_dir) / "stage1_multi_seed_eval.csv", index=False)
 
 hard_profile = build_hard_profile(stage1_pred_df)
 stage2_weights = compute_sample_weights(stage2_records, hard_profile=hard_profile)
@@ -1450,11 +1628,17 @@ print(f"post-train approx accuracy: {post_acc:.4f}")
 display(post_pred_df.head(10))
 print_eval_summaries(post_pred_df, prefix="post-train-valid")
 post_pred_df.to_csv(Path(cfg.work_dir) / "post_train_valid_predictions.csv", index=False)
+post_multi_seed_df = evaluate_multi_seed_views(model, serious_eval_views)
+display(post_multi_seed_df)
+post_multi_seed_df.to_csv(Path(cfg.work_dir) / "post_train_multi_seed_eval.csv", index=False)
 
 consensus_acc, consensus_df = evaluate_with_consensus(model, serious_eval_df.head(min(len(serious_eval_df), 128)), cfg.test_time_template_candidates)
 print(f"post-train consensus accuracy: {consensus_acc:.4f}")
 display(consensus_df.head(10))
 consensus_df.to_csv(Path(cfg.work_dir) / "post_train_consensus_predictions.csv", index=False)
+template_disagreement_df = summarize_template_disagreement(model, serious_eval_df, cfg.test_time_template_candidates, max_rows=128)
+display(template_disagreement_df.head(20))
+template_disagreement_df.to_csv(Path(cfg.work_dir) / "template_disagreement_by_family.csv", index=False)
 
 # %% [markdown]
 # ## Cell 23 — 保存 LoRA adapter，并检查 rank/配置是否合法
