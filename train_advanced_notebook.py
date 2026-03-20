@@ -50,6 +50,7 @@ if INSTALL_PACKAGES:
 # %%
 import gc
 import hashlib
+import importlib.util
 import io
 import json
 import math
@@ -61,7 +62,7 @@ import zipfile
 from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -128,6 +129,8 @@ class CFG:
     serious_eval_examples: int = 256
     serious_eval_seeds: Tuple[int, ...] = (11, 23, 47)
     numeric_rel_tol: float = 1e-2
+    prefer_official_metric_backend: bool = True
+    official_metric_backend_path: Optional[str] = None
 
     # ===== curriculum =====
     stage1_epochs: float = 0.6
@@ -138,17 +141,33 @@ class CFG:
     stage2_lr: float = 9e-5
 
     # ===== optional leaderboard tricks =====
-    enable_external_mixture: bool = False
+    enable_external_mixture: bool = True
     enable_prompt_template_ablation: bool = True
     enable_family_reweight: bool = True
     enable_length_bucket_bonus: bool = True
     run_supervision_ablation: bool = False
-    primary_supervision_variant: str = "answer_only"
-    supervision_ablation_variants: Tuple[str, ...] = ("answer_only", "short_reasoning")
+    primary_supervision_variant: str = "family_aware_mix"
+    supervision_ablation_variants: Tuple[str, ...] = ("answer_only", "short_reasoning", "family_aware_mix")
     supervision_ablation_stage1_epochs: float = 0.20
     supervision_ablation_stage2_epochs: float = 0.20
     supervision_ablation_stage2_rounds: int = 1
     reasoning_template_eval_rows: int = 48
+    enable_consensus_pseudolabel_refresh: bool = True
+    consensus_pseudolabel_max_rows: int = 192
+    consensus_pseudolabel_allowed_families: Tuple[str, ...] = ("bit_transform", "sequence", "matrix_reasoning")
+    consensus_template_ids: Tuple[str, ...] = (
+        "T1_ultra_compact",
+        "T3_hidden_reasoning",
+        "T4_numeric_specialized",
+        "T5_text_specialized",
+    )
+    template_ablation_after_stage1_rows: int = 128
+    template_ablation_stage2_min_gain: float = 0.02
+    template_ablation_family_min_rows: int = 10
+    template_ablation_require_non_worse_boxed_metrics: bool = True
+    template_ablation_secondary_seed: int = 97
+    stage2_asset_refresh_interval_rounds: int = 2
+    stage2_refresh_template_eval_rows: int = 96
     fixed_sanity_rows: int = 64
     stage1_family_frequency_quantile: float = 0.55
     hard_mining_family_boost: float = 0.35
@@ -180,6 +199,7 @@ Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
 Path(cfg.adapter_dir).mkdir(parents=True, exist_ok=True)
 
 assert cfg.lora_r <= cfg.max_lora_rank, "LoRA rank 超过比赛上限 32"
+assert cfg.max_seq_len <= cfg.official_max_model_len, "训练 max_seq_len 超过官方 max_model_len"
 
 # %% [markdown]
 # ## Cell 3 — 固定随机种子 / 环境检查
@@ -268,12 +288,45 @@ def filter_external_data(df: pd.DataFrame) -> pd.DataFrame:
     tmp = tmp[~tmp["answer"].str.contains("todo|unknown|n/a", case=False, na=False)]
     return tmp.reset_index(drop=True)
 
+
+def load_optional_unlabeled_pool(extra_root: str) -> pd.DataFrame:
+    root = Path(extra_root)
+    candidates = sorted(root.glob("**/nemotron_extra_unlabeled*.csv")) + sorted(root.glob("**/nemotron_extra_unlabeled*.parquet"))
+    frames: List[pd.DataFrame] = []
+
+    for path in candidates:
+        if path.suffix == ".csv":
+            tmp = pd.read_csv(path)
+        else:
+            tmp = pd.read_parquet(path)
+        if {"prompt"}.issubset(tmp.columns):
+            tmp = tmp.copy()
+            tmp["id"] = tmp.get("id", [f"unlabeled_{path.stem}_{i}" for i in range(len(tmp))])
+            tmp["source"] = path.stem
+            frames.append(tmp[["id", "prompt", "source"]])
+
+    if not frames:
+        return pd.DataFrame(columns=["id", "prompt", "source"])
+    return pd.concat(frames, ignore_index=True)
+
+
+def filter_unlabeled_pool(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    tmp = df.copy()
+    tmp["prompt"] = tmp["prompt"].astype(str)
+    tmp = tmp[tmp["prompt"].str.len().between(40, 12000)]
+    tmp = tmp[tmp["prompt"].str.contains("->|example|Examples|Now|Solve|Task|Question", regex=True, na=False)]
+    return tmp.reset_index(drop=True)
+
 external_df = load_optional_external_data(cfg.extra_data_dir) if cfg.enable_external_mixture else pd.DataFrame(columns=["id", "prompt", "answer", "source"])
 external_df = filter_external_data(external_df)
+unlabeled_external_df = filter_unlabeled_pool(load_optional_unlabeled_pool(cfg.extra_data_dir))
 full_train_df = pd.concat([train_df, external_df], ignore_index=True)
 
 print("official train:", train_df.shape)
 print("external train:", external_df.shape)
+print("external unlabeled pool:", unlabeled_external_df.shape)
 print("full train:", full_train_df.shape)
 display(full_train_df.head(2))
 
@@ -483,9 +536,51 @@ def extract_prediction(text: str) -> str:
     return official_like_extract_prediction(text)
 
 
+def load_official_metric_backend() -> Optional[Any]:
+    if not cfg.prefer_official_metric_backend:
+        return None
+
+    candidate_paths: List[Path] = []
+    if cfg.official_metric_backend_path:
+        candidate_paths.append(Path(cfg.official_metric_backend_path))
+    candidate_paths.extend([
+        Path(cfg.competition_path) / "evaluation.py",
+        Path(cfg.competition_path) / "metric.py",
+        Path("evaluation.py"),
+        Path("metric.py"),
+    ])
+
+    for path in candidate_paths:
+        if not path.exists():
+            continue
+        spec = importlib.util.spec_from_file_location("nemotron_official_metric", path)
+        if spec is None or spec.loader is None:
+            continue
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        extract_fn = getattr(module, "extract_prediction", None) or getattr(module, "extract_answer", None)
+        score_fn = getattr(module, "score_prediction", None) or getattr(module, "score", None)
+        if extract_fn is not None:
+            print(f"loaded official metric backend from: {path}")
+            return {"path": str(path), "extract_fn": extract_fn, "score_fn": score_fn}
+    print("official metric backend not found; fallback to local official_like extractor")
+    return None
+
+
+OFFICIAL_METRIC_BACKEND = load_official_metric_backend()
+
+
+def metric_extract_prediction(text: str) -> str:
+    if OFFICIAL_METRIC_BACKEND is not None:
+        return canonicalize_answer(OFFICIAL_METRIC_BACKEND["extract_fn"](text))
+    return official_like_extract_prediction(text)
+
+
 def approx_equal(pred: str, gold: str, rel_tol: float = cfg.numeric_rel_tol) -> bool:
     pred_c = canonicalize_answer(pred)
     gold_c = canonicalize_answer(gold)
+    if OFFICIAL_METRIC_BACKEND is not None and OFFICIAL_METRIC_BACKEND.get("score_fn") is not None:
+        return bool(OFFICIAL_METRIC_BACKEND["score_fn"](pred_c, gold_c))
     if pred_c == gold_c:
         return True
 
@@ -596,7 +691,17 @@ TEMPLATE_POOL = {
     "T4_numeric_specialized": template_numeric,
     "T5_text_specialized": template_text,
 }
-BEST_TEMPLATE_BY_FAMILY: Dict[str, str] = {}
+
+
+FAMILY_TEMPLATE_PRIORS: Dict[str, str] = {
+    "bit_transform": "T4_numeric_specialized",
+    "cipher_decrypt": "T5_text_specialized",
+    "fewshot_pattern": "T3_hidden_reasoning",
+    "matrix_reasoning": "T3_hidden_reasoning",
+    "sequence": "T4_numeric_specialized",
+    "open_template": "T5_text_specialized",
+}
+BEST_TEMPLATE_BY_FAMILY: Dict[str, str] = dict(FAMILY_TEMPLATE_PRIORS)
 
 
 def choose_template_id(answer_type: str, prompt_family: str) -> str:
@@ -677,8 +782,48 @@ def build_training_record(row: pd.Series) -> Dict[str, Any]:
         "len_bucket": str(row.example_len_bucket),
     }
 
-train_records = train_fold.apply(build_training_record, axis=1, result_type="expand")
-valid_records = valid_fold.apply(build_training_record, axis=1, result_type="expand")
+
+def build_records_frame(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(
+            columns=[
+                "id",
+                "prompt_family",
+                "template_group",
+                "answer_type",
+                "template_id",
+                "prompt_text",
+                "answer_text",
+                "full_text",
+                "reasoning_full_text",
+                "gold_answer",
+                "source",
+                "difficulty",
+                "prompt_chars",
+                "len_bucket",
+            ]
+        )
+    return df.apply(build_training_record, axis=1, result_type="expand")
+
+
+def split_stage_records(records_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, set]:
+    family_freq = records_df["prompt_family"].value_counts(normalize=True)
+    stable_families = set(
+        family_freq[family_freq >= family_freq.quantile(cfg.stage1_family_frequency_quantile)].index.tolist()
+    )
+    stage1_mask = (
+        records_df["prompt_chars"].le(cfg.stage1_max_prompt_chars)
+        & records_df["prompt_family"].isin(stable_families)
+        & records_df["answer_type"].isin(["numeric", "binary", "short_text"])
+    )
+    stage1_records_local = records_df.loc[stage1_mask].reset_index(drop=True)
+    stage2_records_local = records_df.reset_index(drop=True)
+    return stage1_records_local, stage2_records_local, stable_families
+
+
+train_records = build_records_frame(train_fold)
+valid_records = build_records_frame(valid_fold)
+stage1_records, stage2_records, stable_families = split_stage_records(train_records)
 
 print(train_records.shape, valid_records.shape)
 display(train_records.head(2))
@@ -691,18 +836,6 @@ display(train_records.head(2))
 # - Stage 2 再纳入长文本和复杂 family。
 
 # %%
-family_freq = train_records["prompt_family"].value_counts(normalize=True)
-stable_families = set(
-    family_freq[family_freq >= family_freq.quantile(cfg.stage1_family_frequency_quantile)].index.tolist()
-)
-stage1_mask = (
-    train_records["prompt_chars"].le(cfg.stage1_max_prompt_chars)
-    & train_records["prompt_family"].isin(stable_families)
-    & train_records["answer_type"].isin(["numeric", "binary", "short_text"])
-)
-stage1_records = train_records.loc[stage1_mask].reset_index(drop=True)
-stage2_records = train_records.reset_index(drop=True)
-
 print("stage1 records:", stage1_records.shape)
 print("stage2 records:", stage2_records.shape)
 print("stable families used in stage1:", sorted(stable_families)[:20])
@@ -830,18 +963,32 @@ def build_supervision_variant_panel(records_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-stage1_variant_ds = {
-    variant: build_variant_datasets(stage1_records, variant)
-    for variant in ["answer_only", "short_reasoning", "family_aware_mix"]
-}
-stage2_variant_ds = {
-    variant: build_variant_datasets(stage2_records, variant)
-    for variant in ["answer_only", "short_reasoning", "family_aware_mix"]
-}
-valid_variant_ds = {
-    variant: build_variant_datasets(valid_records, variant)
-    for variant in ["answer_only", "short_reasoning", "family_aware_mix"]
-}
+def refresh_variant_datasets(
+    stage1_records_df: pd.DataFrame,
+    stage2_records_df: pd.DataFrame,
+    valid_records_df: pd.DataFrame,
+) -> Tuple[Dict[str, Dataset], Dict[str, Dataset], Dict[str, Dataset]]:
+    variants = ["answer_only", "short_reasoning", "family_aware_mix"]
+    stage1_variant_local = {
+        variant: build_variant_datasets(stage1_records_df, variant)
+        for variant in variants
+    }
+    stage2_variant_local = {
+        variant: build_variant_datasets(stage2_records_df, variant)
+        for variant in variants
+    }
+    valid_variant_local = {
+        variant: build_variant_datasets(valid_records_df, variant)
+        for variant in variants
+    }
+    return stage1_variant_local, stage2_variant_local, valid_variant_local
+
+
+stage1_variant_ds, stage2_variant_ds, valid_variant_ds = refresh_variant_datasets(
+    stage1_records,
+    stage2_records,
+    valid_records,
+)
 
 stage1_ds = stage1_variant_ds[cfg.primary_supervision_variant]
 stage2_ds = stage2_variant_ds[cfg.primary_supervision_variant]
@@ -1052,7 +1199,7 @@ def build_seeded_family_balanced_subset(df: pd.DataFrame, max_rows: int, seed: i
 
 
 fast_eval_df = stratified_valid_subset(valid_fold, cfg.fast_eval_examples)
-serious_eval_df = stratified_valid_subset(valid_fold, cfg.serious_eval_examples)
+serious_eval_df = build_seeded_family_balanced_subset(valid_fold, cfg.serious_eval_examples, seed=cfg.seed)
 serious_eval_views = {
     seed: build_seeded_family_balanced_subset(valid_fold, cfg.serious_eval_examples, seed=seed)
     for seed in cfg.serious_eval_seeds
@@ -1086,7 +1233,7 @@ def evaluate_accuracy(
     df: pd.DataFrame,
     template_override: Optional[str] = None,
     max_new_tokens_grid: Sequence[int] = (64, 96),
-    extractor_fn=official_like_extract_prediction,
+    extractor_fn=metric_extract_prediction,
 ) -> Tuple[float, pd.DataFrame]:
     rows = []
     for row in df.itertuples(index=False):
@@ -1201,7 +1348,7 @@ def print_eval_summaries(pred_df: pd.DataFrame, prefix: str) -> None:
 def evaluate_multi_seed_views(
     model: torch.nn.Module,
     eval_views: Dict[int, pd.DataFrame],
-    extractor_fn=official_like_extract_prediction,
+    extractor_fn=metric_extract_prediction,
 ) -> pd.DataFrame:
     rows = []
     for seed, view_df in eval_views.items():
@@ -1237,6 +1384,23 @@ def build_hard_profile(pred_df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
     }
 
 
+def run_serious_eval_suite(
+    model: torch.nn.Module,
+    primary_df: pd.DataFrame,
+    eval_views: Dict[int, pd.DataFrame],
+    prefix: str,
+    extractor_fn=metric_extract_prediction,
+) -> Tuple[float, pd.DataFrame, pd.DataFrame]:
+    primary_acc, primary_pred_df = evaluate_accuracy(model, primary_df, extractor_fn=extractor_fn)
+    print(f"{prefix} serious accuracy: {primary_acc:.4f}")
+    print_eval_summaries(primary_pred_df, prefix=prefix)
+    multi_seed_df = evaluate_multi_seed_views(model, eval_views, extractor_fn=extractor_fn)
+    display(multi_seed_df)
+    primary_pred_df.to_csv(Path(cfg.work_dir) / f"{prefix}_predictions.csv", index=False)
+    multi_seed_df.to_csv(Path(cfg.work_dir) / f"{prefix}_multi_seed_eval.csv", index=False)
+    return primary_acc, primary_pred_df, multi_seed_df
+
+
 def update_replay_buffer(
     replay_buffer: Dict[str, int],
     pred_df: pd.DataFrame,
@@ -1250,7 +1414,7 @@ def update_replay_buffer(
     return replay_buffer
 
 
-def run_template_ablation(model: torch.nn.Module, df: pd.DataFrame, max_rows: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def run_template_ablation(model: torch.nn.Module, df: pd.DataFrame, max_rows: int) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     eval_df = df.head(max_rows).copy()
     rows = []
     mapping_rows = []
@@ -1266,19 +1430,117 @@ def run_template_ablation(model: torch.nn.Module, df: pd.DataFrame, max_rows: in
             }
         )
         family_scores = (
-            pred_df.groupby("prompt_family")["hit"].mean().reset_index().rename(columns={"hit": "accuracy"})
+            pred_df.groupby("prompt_family")
+            .agg(
+                accuracy=("hit", "mean"),
+                family_rows=("hit", "size"),
+                has_boxed_rate=("has_boxed", "mean"),
+                boxed_parse_rate=("boxed_parsed_success", "mean"),
+            )
+            .reset_index()
         )
         family_scores["template_id"] = template_id
         mapping_rows.append(family_scores)
     score_df = pd.DataFrame(rows).sort_values(["accuracy", "boxed_parse_rate", "has_boxed_rate"], ascending=False).reset_index(drop=True)
     mapping_df = pd.concat(mapping_rows, ignore_index=True)
     best_mapping = (
-        mapping_df.sort_values(["prompt_family", "accuracy"], ascending=[True, False])
+        mapping_df.sort_values(["prompt_family", "accuracy", "family_rows"], ascending=[True, False, False])
         .groupby("prompt_family", as_index=False)
         .first()
         .rename(columns={"template_id": "best_template_id", "accuracy": "best_accuracy"})
     )
-    return score_df, best_mapping
+    return score_df, best_mapping, mapping_df
+
+
+def lookup_template_family_metrics(mapping_df: Optional[pd.DataFrame], family: str, template_id: str) -> Dict[str, float]:
+    if mapping_df is None or mapping_df.empty:
+        return {
+            "accuracy": 0.0,
+            "family_rows": 0.0,
+            "has_boxed_rate": 0.0,
+            "boxed_parse_rate": 0.0,
+        }
+    match = mapping_df.loc[
+        (mapping_df["prompt_family"] == family) & (mapping_df["template_id"] == template_id)
+    ]
+    if match.empty:
+        return {
+            "accuracy": 0.0,
+            "family_rows": 0.0,
+            "has_boxed_rate": 0.0,
+            "boxed_parse_rate": 0.0,
+        }
+    row = match.iloc[0]
+    return {
+        "accuracy": float(row.get("accuracy", 0.0)),
+        "family_rows": float(row.get("family_rows", 0.0)),
+        "has_boxed_rate": float(row.get("has_boxed_rate", 0.0)),
+        "boxed_parse_rate": float(row.get("boxed_parse_rate", 0.0)),
+    }
+
+
+def apply_template_ablation_updates(
+    current_map: Dict[str, str],
+    best_mapping_df: pd.DataFrame,
+    full_mapping_df: pd.DataFrame,
+    secondary_mapping_df: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    decisions = []
+    updated_map = dict(current_map)
+    for row in best_mapping_df.itertuples(index=False):
+        family = row.prompt_family
+        new_template = row.best_template_id
+        family_rows = int(row.family_rows)
+        old_template = current_map.get(family, FAMILY_TEMPLATE_PRIORS.get(family, "T2_compact"))
+
+        old_metrics = lookup_template_family_metrics(full_mapping_df, family, old_template)
+        new_metrics = lookup_template_family_metrics(full_mapping_df, family, new_template)
+        gain = new_metrics["accuracy"] - old_metrics["accuracy"]
+        boxed_ok = (
+            not cfg.template_ablation_require_non_worse_boxed_metrics
+            or (
+                new_metrics["has_boxed_rate"] >= old_metrics["has_boxed_rate"]
+                and new_metrics["boxed_parse_rate"] >= old_metrics["boxed_parse_rate"]
+            )
+        )
+
+        secondary_old_metrics = lookup_template_family_metrics(secondary_mapping_df, family, old_template) if secondary_mapping_df is not None else old_metrics
+        secondary_new_metrics = lookup_template_family_metrics(secondary_mapping_df, family, new_template) if secondary_mapping_df is not None else new_metrics
+        passed_multi_view_check = secondary_new_metrics["accuracy"] >= secondary_old_metrics["accuracy"]
+        should_update = (
+            family_rows >= cfg.template_ablation_family_min_rows
+            and gain >= cfg.template_ablation_stage2_min_gain
+            and boxed_ok
+            and passed_multi_view_check
+        )
+        if should_update:
+            updated_map[family] = new_template
+        decisions.append(
+            {
+                "prompt_family": family,
+                "family_rows": family_rows,
+                "old_template_id": old_template,
+                "old_accuracy": old_metrics["accuracy"],
+                "old_has_boxed_rate": old_metrics["has_boxed_rate"],
+                "old_boxed_parse_rate": old_metrics["boxed_parse_rate"],
+                "candidate_template_id": new_template,
+                "candidate_accuracy": new_metrics["accuracy"],
+                "candidate_has_boxed_rate": new_metrics["has_boxed_rate"],
+                "candidate_boxed_parse_rate": new_metrics["boxed_parse_rate"],
+                "gain": gain,
+                "secondary_old_accuracy": secondary_old_metrics["accuracy"],
+                "secondary_candidate_accuracy": secondary_new_metrics["accuracy"],
+                "boxed_ok": boxed_ok,
+                "passed_multi_view_check": passed_multi_view_check,
+                "min_gain": cfg.template_ablation_stage2_min_gain,
+                "min_rows": cfg.template_ablation_family_min_rows,
+                "updated": should_update,
+                "applied_template_id": updated_map.get(family, old_template),
+            }
+        )
+    BEST_TEMPLATE_BY_FAMILY.clear()
+    BEST_TEMPLATE_BY_FAMILY.update(updated_map)
+    return pd.DataFrame(decisions).sort_values(["updated", "gain", "family_rows"], ascending=[False, False, False]).reset_index(drop=True)
 
 
 @torch.no_grad()
@@ -1287,7 +1549,7 @@ def ensemble_predict(model: torch.nn.Module, prompt_text: str, template_ids: Seq
     raw_candidates = []
     for template_id in template_ids:
         raw = generate_answer_text(model, TEMPLATE_POOL[template_id](prompt_text))
-        pred = extract_prediction(raw)
+        pred = metric_extract_prediction(raw)
         votes.append(pred)
         raw_candidates.append({"template_id": template_id, "pred": pred, "raw": raw[:800]})
 
@@ -1323,21 +1585,45 @@ def evaluate_with_consensus(model: torch.nn.Module, df: pd.DataFrame, template_i
     return float(out["hit"].mean()) if len(out) else 0.0, out
 
 
+def pseudolabel_passes_family_filter(prompt_family: str, answer_type: str, pred: str) -> bool:
+    pred = canonicalize_answer(pred)
+    if prompt_family not in set(cfg.consensus_pseudolabel_allowed_families):
+        return False
+    if answer_type == "multi_token_text":
+        return False
+    if answer_type == "binary":
+        return bool(BINARY_RE.fullmatch(pred))
+    if answer_type == "numeric":
+        return bool(ANSWER_NUMBER_RE.fullmatch(pred.replace(",", "")))
+    if prompt_family == "bit_transform":
+        return bool(BINARY_RE.fullmatch(pred))
+    if prompt_family in {"sequence", "matrix_reasoning"}:
+        return bool(ANSWER_NUMBER_RE.fullmatch(pred.replace(",", "")) or re.fullmatch(r"[A-Za-z0-9]{1,16}", pred))
+    return False
+
+
 @torch.no_grad()
 def build_consensus_pseudolabels(model: torch.nn.Module, unlabeled_df: pd.DataFrame, template_ids: Sequence[str], max_rows: int = 128) -> pd.DataFrame:
     rows = []
     for row in unlabeled_df.head(max_rows).itertuples(index=False):
+        prompt_family = infer_prompt_family(row.prompt)
         result = ensemble_predict(model, row.prompt, template_ids=template_ids)
-        if result["votes"] == result["num_templates"]:
-            rows.append(
-                {
-                    "id": getattr(row, "id", f"pseudo_{len(rows)}"),
-                    "prompt": row.prompt,
-                    "answer": result["pred"],
-                    "source": "consensus_pseudolabel",
-                    "confidence": result["votes"] / result["num_templates"],
-                }
-            )
+        answer_type = infer_answer_type(result["pred"])
+        if result["votes"] != result["num_templates"]:
+            continue
+        if not pseudolabel_passes_family_filter(prompt_family, answer_type, result["pred"]):
+            continue
+        rows.append(
+            {
+                "id": getattr(row, "id", f"pseudo_{len(rows)}"),
+                "prompt": row.prompt,
+                "answer": result["pred"],
+                "source": f"consensus_pseudolabel::{prompt_family}",
+                "confidence": result["votes"] / result["num_templates"],
+                "prompt_family": prompt_family,
+                "answer_type": answer_type,
+            }
+        )
     return pd.DataFrame(rows)
 
 
@@ -1427,16 +1713,131 @@ def build_training_args(stage_name: str, lr: float, epochs: float) -> TrainingAr
     )
 
 
-def train_stage2_with_refresh(
+def maybe_extend_stage2_with_pseudolabels(
+    model: torch.nn.Module,
+    stage2_records_df: pd.DataFrame,
+    unlabeled_df: pd.DataFrame,
+) -> pd.DataFrame:
+    if not cfg.enable_consensus_pseudolabel_refresh or unlabeled_df.empty:
+        return stage2_records_df
+
+    pseudo_df = build_consensus_pseudolabels(
+        model,
+        unlabeled_df,
+        template_ids=cfg.consensus_template_ids,
+        max_rows=cfg.consensus_pseudolabel_max_rows,
+    )
+    if pseudo_df.empty:
+        print("no consensus pseudolabels were added to stage2")
+        return stage2_records_df
+
+    pseudo_df = pseudo_df.assign(
+        prompt_family=pseudo_df["prompt"].map(infer_prompt_family),
+        template_group=pseudo_df["prompt"].map(infer_template_group),
+        answer_type=pseudo_df["answer"].map(infer_answer_type),
+        prompt_chars=pseudo_df["prompt"].str.len(),
+        answer_chars=pseudo_df["answer"].astype(str).str.len(),
+        example_len_bucket=pd.cut(
+            pseudo_df["prompt"].str.len(),
+            bins=[0, 400, 800, 1400, 4000, 20000],
+            labels=["xs", "s", "m", "l", "xl"],
+            include_lowest=True,
+        ),
+    )
+    pseudo_records = build_records_frame(pseudo_df)
+    out = pd.concat([stage2_records_df, pseudo_records], ignore_index=True)
+    out = out.drop_duplicates(subset=["prompt_text", "answer_text", "source"]).reset_index(drop=True)
+    pseudo_records.to_csv(Path(cfg.work_dir) / "consensus_pseudolabel_records.csv", index=False)
+    print(f"added consensus pseudolabels to stage2: {len(pseudo_records)} rows")
+    return out
+
+
+def refresh_stage2_training_assets(
+    train_fold_df: pd.DataFrame,
+    valid_fold_df: pd.DataFrame,
+    stage1_records_df: pd.DataFrame,
+    current_model: Optional[torch.nn.Module] = None,
+    unlabeled_df: Optional[pd.DataFrame] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Dataset], Dict[str, Dataset], Dataset, Dataset, np.ndarray, pd.DataFrame]:
+    refreshed_train_records = build_records_frame(train_fold_df)
+    refreshed_valid_records = build_records_frame(valid_fold_df)
+    _stage1_records_ref, stage2_records_ref, _ = split_stage_records(refreshed_train_records)
+    stage2_records_ref = maybe_extend_stage2_with_pseudolabels(current_model, stage2_records_ref, unlabeled_df if unlabeled_df is not None else pd.DataFrame()) if current_model is not None else stage2_records_ref
+    _, stage2_variant_ref, valid_variant_ref = refresh_variant_datasets(stage1_records_df, stage2_records_ref, refreshed_valid_records)
+    stage2_ds_ref = stage2_variant_ref[cfg.primary_supervision_variant]
+    valid_ds_ref = valid_variant_ref[cfg.primary_supervision_variant]
+    stage2_weights_ref = compute_sample_weights(stage2_records_ref)
+    return refreshed_train_records, refreshed_valid_records, stage2_variant_ref, valid_variant_ref, stage2_ds_ref, valid_ds_ref, stage2_weights_ref, stage2_records_ref
+
+
+def perform_conservative_template_refresh(
+    model: torch.nn.Module,
+    eval_df_primary: pd.DataFrame,
+    eval_df_secondary: pd.DataFrame,
+    prefix: str,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    template_score_df, family_template_map_df, family_template_full_df = run_template_ablation(
+        model,
+        eval_df_primary,
+        len(eval_df_primary),
+    )
+    _secondary_score_df, _secondary_best_df, family_template_secondary_df = run_template_ablation(
+        model,
+        eval_df_secondary,
+        len(eval_df_secondary),
+    )
+    template_update_decisions_df = apply_template_ablation_updates(
+        dict(BEST_TEMPLATE_BY_FAMILY),
+        family_template_map_df,
+        family_template_full_df,
+        secondary_mapping_df=family_template_secondary_df,
+    )
+    template_score_df.to_csv(Path(cfg.work_dir) / f"{prefix}_template_ablation_scores.csv", index=False)
+    family_template_map_df.to_csv(Path(cfg.work_dir) / f"{prefix}_family_template_map.csv", index=False)
+    family_template_full_df.to_csv(Path(cfg.work_dir) / f"{prefix}_family_template_full.csv", index=False)
+    template_update_decisions_df.to_csv(Path(cfg.work_dir) / f"{prefix}_family_template_update_decisions.csv", index=False)
+    return template_score_df, family_template_map_df, family_template_full_df, template_update_decisions_df
+
+
+def maybe_refresh_stage2_assets(
+    model: torch.nn.Module,
+    round_idx: int,
+    replay_buffer: Dict[str, int],
+    hard_profile: Dict[str, Dict[str, float]],
+    refresh_assets_fn: Optional[Callable[[torch.nn.Module, int], Optional[Dict[str, Any]]]] = None,
+) -> Optional[Dict[str, Any]]:
+    if refresh_assets_fn is None:
+        return None
+    if cfg.stage2_asset_refresh_interval_rounds <= 0:
+        return None
+    round_number = round_idx + 1
+    if round_number >= cfg.stage2_rounds:
+        return None
+    if round_number % cfg.stage2_asset_refresh_interval_rounds != 0:
+        return None
+    refreshed = refresh_assets_fn(model, round_number)
+    if refreshed is None:
+        return None
+    refreshed["sample_weights"] = compute_sample_weights(
+        refreshed["train_records_df"],
+        hard_profile=hard_profile,
+        replay_buffer=replay_buffer,
+    )
+    return refreshed
+
+
+def train_stage2_with_reweight(
     model: torch.nn.Module,
     train_dataset: Dataset,
     eval_dataset: Dataset,
     train_records_df: pd.DataFrame,
     initial_weights: np.ndarray,
-) -> Tuple[torch.nn.Module, pd.DataFrame]:
+    replay_buffer: Optional[Dict[str, int]] = None,
+    refresh_assets_fn: Optional[Callable[[torch.nn.Module, int], Optional[Dict[str, Any]]]] = None,
+) -> Tuple[torch.nn.Module, pd.DataFrame, Dict[str, int]]:
     current_weights = initial_weights
     last_pred_df = pd.DataFrame()
-    replay_buffer: Dict[str, int] = {}
+    replay_buffer = dict(replay_buffer or {})
     per_round_epochs = cfg.stage2_epochs / max(cfg.stage2_rounds, 1)
 
     for round_idx in range(cfg.stage2_rounds):
@@ -1452,10 +1853,12 @@ def train_stage2_with_refresh(
         )
         trainer.train()
 
-        round_acc, last_pred_df = evaluate_accuracy(model, serious_eval_df)
-        print(f"stage2 round {round_idx + 1}/{cfg.stage2_rounds} approx accuracy: {round_acc:.4f}")
-        print_eval_summaries(last_pred_df, prefix=f"stage2-round-{round_idx + 1}")
-        last_pred_df.to_csv(Path(cfg.work_dir) / f"stage2_round_{round_idx + 1}_predictions.csv", index=False)
+        round_acc, last_pred_df, round_multi_seed_df = run_serious_eval_suite(
+            model,
+            serious_eval_df,
+            serious_eval_views,
+            prefix=f"stage2_round_{round_idx + 1}",
+        )
 
         hard_profile = build_hard_profile(last_pred_df)
         probe_acc, replay_probe_pred_df = evaluate_accuracy(model, train_replay_probe_df, extractor_fn=fast_extract_prediction)
@@ -1463,12 +1866,25 @@ def train_stage2_with_refresh(
         replay_buffer = update_replay_buffer(replay_buffer, replay_probe_pred_df)
         current_weights = compute_sample_weights(train_records_df, hard_profile=hard_profile, replay_buffer=replay_buffer)
         print(f"replay probe accuracy round {round_idx + 1}: {probe_acc:.4f}; replay buffer size={len(replay_buffer)}")
+        refreshed_assets = maybe_refresh_stage2_assets(
+            model,
+            round_idx,
+            replay_buffer,
+            hard_profile,
+            refresh_assets_fn=refresh_assets_fn,
+        )
+        if refreshed_assets is not None:
+            train_dataset = refreshed_assets["train_dataset"]
+            eval_dataset = refreshed_assets["eval_dataset"]
+            train_records_df = refreshed_assets["train_records_df"]
+            current_weights = refreshed_assets["sample_weights"]
+            print(f"stage2 assets refreshed after round {round_idx + 1}; new train rows={len(train_records_df)}")
         print(
             f"refreshed weights after round {round_idx + 1}:",
             np.quantile(current_weights, [0, 0.25, 0.5, 0.75, 1]),
         )
 
-    return model, last_pred_df
+    return model, last_pred_df, replay_buffer
 
 
 def run_supervision_variant_experiment(variant: str) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
@@ -1522,13 +1938,11 @@ def run_supervision_variant_experiment(variant: str) -> Tuple[pd.DataFrame, Dict
     return overall_df, grouped
 
 # %% [markdown]
-# ## Cell 18 — A/B 监督形式与模板池预检
+# ## Cell 18 — A/B 监督形式预检 + 训练前模板先验
 # 
-# 这里不直接跑完整双训练，而是先用固定 sanity 子集做：
-# - supervision 形式对照（answer-only vs short-reasoning）
-# - prompt template 池评估
-# 
-# 真正的大训练只保留一个主配置，但你可以据此快速切换 `cfg.primary_supervision_variant`。
+# 这里保留 supervision 形式对照，但**不再**用未训练模型做 template ablation。
+# 训练前只启用 family-aware 的启发式模板先验；真正的模型驱动 template ablation
+# 放到 Stage 1 之后，再刷新 Stage 2 训练集和数据集对象。
 
 # %%
 print("supervision variant sizes:")
@@ -1536,13 +1950,15 @@ for variant, ds in stage2_variant_ds.items():
     print(variant, len(ds))
     sample_idx = 0
     sample_row = make_supervision_frame(stage2_records.head(1), variant).iloc[sample_idx]
-    preview_text = sample_row["full_text"] if variant == "answer_only" else sample_row["reasoning_full_text"]
+    preview_text = sample_row["full_text"] if sample_row["supervision_variant"] == "answer_only" else sample_row["reasoning_full_text"]
     print(f"\n[{variant}] sample target preview:\n{preview_text[:500]}\n")
 
 variant_panel_df = build_supervision_variant_panel(stage2_records.head(min(len(stage2_records), 256)))
 display(variant_panel_df)
 variant_panel_df.to_csv(Path(cfg.work_dir) / "supervision_variant_panel.csv", index=False)
-print("A/B 实验建议：分别将 cfg.primary_supervision_variant 设为 answer_only 与 short_reasoning，比较各自导出的 grouped metrics CSV。")
+print("current primary supervision variant:", cfg.primary_supervision_variant)
+print("initial family template priors:")
+display(pd.DataFrame(sorted(BEST_TEMPLATE_BY_FAMILY.items()), columns=["prompt_family", "template_id"]))
 
 if cfg.run_supervision_ablation:
     ablation_overall = []
@@ -1555,18 +1971,13 @@ if cfg.run_supervision_ablation:
     display(ablation_overall_df)
     ablation_overall_df.to_csv(Path(cfg.work_dir) / "supervision_ablation_overall.csv", index=False)
 else:
-    print("skip full supervision ablation: set cfg.run_supervision_ablation=True to run answer_only vs short_reasoning side-by-side.")
+    print("skip full supervision ablation: set cfg.run_supervision_ablation=True to compare answer_only / short_reasoning / family_aware_mix side-by-side.")
 
-if cfg.enable_prompt_template_ablation:
-    template_score_df, family_template_map_df = run_template_ablation(model, fixed_sanity_df, cfg.reasoning_template_eval_rows)
-    BEST_TEMPLATE_BY_FAMILY.update(dict(zip(family_template_map_df["prompt_family"], family_template_map_df["best_template_id"])))
-    display(template_score_df)
-    display(family_template_map_df.head(20))
-    template_score_df.to_csv(Path(cfg.work_dir) / "template_ablation_scores.csv", index=False)
-    family_template_map_df.to_csv(Path(cfg.work_dir) / "family_template_map.csv", index=False)
-else:
-    template_score_df = pd.DataFrame()
-    family_template_map_df = pd.DataFrame(columns=["prompt_family", "best_template_id", "best_accuracy"])
+template_preview_df = build_seeded_family_balanced_subset(valid_fold, cfg.reasoning_template_eval_rows, seed=cfg.seed)
+print("template preview rows (reasoning_template_eval_rows):", template_preview_df.shape)
+template_score_df = pd.DataFrame()
+family_template_map_df = pd.DataFrame(columns=["prompt_family", "best_template_id", "best_accuracy", "family_rows"])
+template_update_decisions_df = pd.DataFrame()
 
 # %% [markdown]
 # ## Cell 19 — Stage 1 训练（短 / 规则明显 family 先收敛）
@@ -1592,45 +2003,129 @@ else:
     print("skip stage1: no samples after curriculum filter")
 
 # %% [markdown]
-# ## Cell 20 — 动态 hard mining：根据 Stage 1 错误更新采样权重
+# ## Cell 20 — Stage 1 后刷新模板映射 / serious eval / Stage 2 权重
+# 
+# 关键修复点：
+# - 模板消融改到 Stage 1 之后执行，避免未训练模型噪声；
+# - 一旦更新 family-specific best template map，就立刻重建 train/valid records 与 Stage 2 datasets；
+# - Serious eval 使用 family-balanced 主视图 + 多 seed 视图；
+# - Sample-level replay 在进入 Stage 2 前先用训练 probe 错题做一次 bootstrap。
 
 # %%
-stage1_acc, stage1_pred_df = evaluate_accuracy(model, serious_eval_df)
-print(f"stage1 approx accuracy: {stage1_acc:.4f}")
-print_eval_summaries(stage1_pred_df, prefix="stage1-valid")
-stage1_pred_df.to_csv(Path(cfg.work_dir) / "stage1_valid_predictions.csv", index=False)
-stage1_multi_seed_df = evaluate_multi_seed_views(model, serious_eval_views)
-display(stage1_multi_seed_df)
-stage1_multi_seed_df.to_csv(Path(cfg.work_dir) / "stage1_multi_seed_eval.csv", index=False)
+stage1_acc, stage1_pred_df, stage1_multi_seed_df = run_serious_eval_suite(
+    model,
+    serious_eval_df,
+    serious_eval_views,
+    prefix="stage1_valid",
+)
 
-hard_profile = build_hard_profile(stage1_pred_df)
-stage2_weights = compute_sample_weights(stage2_records, hard_profile=hard_profile)
+stage1_train_probe_acc, stage1_train_probe_pred_df = evaluate_accuracy(
+    model,
+    train_replay_probe_df,
+    extractor_fn=fast_extract_prediction,
+)
+print(f"stage1 train replay probe accuracy: {stage1_train_probe_acc:.4f}")
+stage1_train_probe_pred_df.to_csv(Path(cfg.work_dir) / "stage1_train_probe_predictions.csv", index=False)
+replay_buffer = update_replay_buffer({}, stage1_train_probe_pred_df)
+print("bootstrapped replay buffer size:", len(replay_buffer))
+
+if cfg.enable_prompt_template_ablation:
+    template_eval_rows = max(cfg.reasoning_template_eval_rows, cfg.template_ablation_after_stage1_rows)
+    template_eval_df = build_seeded_family_balanced_subset(
+        valid_fold,
+        template_eval_rows,
+        seed=cfg.seed,
+    )
+    template_secondary_eval_df = build_seeded_family_balanced_subset(
+        valid_fold,
+        template_eval_rows,
+        seed=cfg.template_ablation_secondary_seed,
+    )
+    template_score_df, family_template_map_df, family_template_full_df, template_update_decisions_df = perform_conservative_template_refresh(
+        model,
+        template_eval_df,
+        template_secondary_eval_df,
+        prefix="stage1",
+    )
+    display(template_score_df)
+    display(family_template_map_df.head(20))
+    display(template_update_decisions_df.head(20))
+
+train_records, valid_records, stage2_variant_ds, valid_variant_ds, stage2_ds, valid_ds, stage2_weights, stage2_records = refresh_stage2_training_assets(
+    train_fold,
+    valid_fold,
+    stage1_records,
+    current_model=model,
+    unlabeled_df=unlabeled_external_df,
+)
+print("refreshed stage2 records:", stage2_records.shape)
+print("refreshed valid records:", valid_records.shape)
 print("updated stage2 weight summary:", np.quantile(stage2_weights, [0, 0.25, 0.5, 0.75, 1]))
 
+hard_profile = build_hard_profile(stage1_pred_df)
+stage2_weights = compute_sample_weights(stage2_records, hard_profile=hard_profile, replay_buffer=replay_buffer)
+print("stage2 weight summary after hard profile + replay bootstrap:", np.quantile(stage2_weights, [0, 0.25, 0.5, 0.75, 1]))
 # %% [markdown]
-# ## Cell 21 — Stage 2 训练（多轮错题驱动重加权）
+# ## Cell 21 — Stage 2 训练（多轮重加权，而非轮间重建数据资产）
 
 # %%
-model, stage2_last_pred_df = train_stage2_with_refresh(
+def refresh_stage2_assets_for_round(current_model: torch.nn.Module, completed_round: int) -> Optional[Dict[str, Any]]:
+    if cfg.enable_prompt_template_ablation:
+        round_eval_df = build_seeded_family_balanced_subset(
+            valid_fold,
+            cfg.stage2_refresh_template_eval_rows,
+            seed=cfg.seed + completed_round,
+        )
+        round_secondary_eval_df = build_seeded_family_balanced_subset(
+            valid_fold,
+            cfg.stage2_refresh_template_eval_rows,
+            seed=cfg.template_ablation_secondary_seed + completed_round,
+        )
+        _score_df, _map_df, _full_df, round_decisions_df = perform_conservative_template_refresh(
+            current_model,
+            round_eval_df,
+            round_secondary_eval_df,
+            prefix=f"stage2_round_{completed_round}",
+        )
+        display(round_decisions_df.head(12))
+
+    refreshed_train_records, refreshed_valid_records, refreshed_stage2_variant_ds, refreshed_valid_variant_ds, refreshed_stage2_ds, refreshed_valid_ds, refreshed_stage2_weights, refreshed_stage2_records = refresh_stage2_training_assets(
+        train_fold,
+        valid_fold,
+        stage1_records,
+        current_model=current_model,
+        unlabeled_df=unlabeled_external_df,
+    )
+    return {
+        "train_records_df": refreshed_stage2_records,
+        "train_dataset": refreshed_stage2_ds,
+        "eval_dataset": refreshed_valid_ds,
+        "valid_records_df": refreshed_valid_records,
+        "sample_weights": refreshed_stage2_weights,
+    }
+
+
+model, stage2_last_pred_df, replay_buffer = train_stage2_with_reweight(
     model=model,
     train_dataset=stage2_ds,
     eval_dataset=valid_ds,
     train_records_df=stage2_records,
     initial_weights=stage2_weights,
+    replay_buffer=replay_buffer,
+    refresh_assets_fn=refresh_stage2_assets_for_round,
 )
 
 # %% [markdown]
 # ## Cell 22 — 训练后本地近似评估 + 分组报表
 
 # %%
-post_acc, post_pred_df = evaluate_accuracy(model, serious_eval_df)
-print(f"post-train approx accuracy: {post_acc:.4f}")
+post_acc, post_pred_df, post_multi_seed_df = run_serious_eval_suite(
+    model,
+    serious_eval_df,
+    serious_eval_views,
+    prefix="post_train_valid",
+)
 display(post_pred_df.head(10))
-print_eval_summaries(post_pred_df, prefix="post-train-valid")
-post_pred_df.to_csv(Path(cfg.work_dir) / "post_train_valid_predictions.csv", index=False)
-post_multi_seed_df = evaluate_multi_seed_views(model, serious_eval_views)
-display(post_multi_seed_df)
-post_multi_seed_df.to_csv(Path(cfg.work_dir) / "post_train_multi_seed_eval.csv", index=False)
 
 consensus_acc, consensus_df = evaluate_with_consensus(model, serious_eval_df.head(min(len(serious_eval_df), 128)), cfg.test_time_template_candidates)
 print(f"post-train consensus accuracy: {consensus_acc:.4f}")
@@ -1689,21 +2184,28 @@ smoke_rows = []
 for row in smoke_df.itertuples(index=False):
     _template_id, prompt_text = choose_template(row.prompt, "numeric", infer_prompt_family(row.prompt))
     raw = generate_answer_text(model, prompt_text)
-    pred = extract_prediction(raw)
+    pred = metric_extract_prediction(raw)
     smoke_rows.append({"id": row.id, "pred": pred, "raw": raw[:1000]})
 smoke_pred_df = pd.DataFrame(smoke_rows)
 display(smoke_pred_df)
 smoke_pred_df.to_csv(Path(cfg.work_dir) / "smoke_predictions.csv", index=False)
 
 # %% [markdown]
-# ## Cell 26 — 冲奖建议：你接下来最值得继续做的 6 件事
+# ## Cell 26 — 已落地能力 vs 下一步冲奖路线
 # 
-# 1. **外挂高质量 synthetic data**：对每个 prompt family 做 teacher 生成 / programmatic augmentation。
-# 2. **做 family-level ablation**：分家族统计本地 acc，针对弱项单独补数据。
-# 3. **引入 rejection sampling**：teacher 多采样，只保留 exact-match 或可验证正确的样本。
-# 4. **训练后做 prompt ensemble**：同一个 adapter 用 2~4 个模板离线 A/B，选最优模板提交。
-# 5. **局部 RL / DPO**：只对 hardest families 做偏好优化，避免全局噪声放大。
-# 6. **多次 seed + CV bagging**：不同 family split 训练多个 rank-32 adapter，再选最佳单模提交。
+# **这一版已经落地：**
+# 1. `family_aware_mix` 主监督路径。
+# 2. Stage 1 后 template ablation，并强制刷新 Stage 2 records / datasets。
+# 3. group hard mining + sample-level replay buffer 联合重加权。
+# 4. serious eval（family-balanced 主视图 + 多 seed 视图）。
+# 5. external mixture + consensus pseudolabel refresh 主路径接口。
+# 
+# **下一步仍然值得继续做：**
+# 1. 更高质量的 family-specific synthetic data + verifier 过滤。
+# 2. rejection sampling / self-distill，进一步提高伪标签质量。
+# 3. 训练后做 prompt ensemble，按 family 或 answer_type 选择推理模板。
+# 4. 只对 hardest families 做局部 RL / DPO / preference optimization。
+# 5. 多 fold / 多 seed bagging，提升 private leaderboard 稳定性。
 
 # %% [markdown]
 # ## Cell 27 — 释放显存 / 导出配置快照
