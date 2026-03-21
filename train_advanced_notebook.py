@@ -92,6 +92,18 @@ class CFG:
     adapter_dir: str = "/kaggle/working/nemotron_advanced/adapter"
     submission_zip: str = "/kaggle/working/submission.zip"
 
+    # ===== candidate / final selection =====
+    topk_candidate_keep: int = 5
+    topk_candidate_dir: str = "/kaggle/working/nemotron_advanced/topk_candidates"
+    topk_candidate_manifest_path: str = "/kaggle/working/nemotron_advanced/topk_candidates_manifest.csv"
+    final_rerank_report_path: str = "/kaggle/working/nemotron_advanced/final_rerank_report.csv"
+    final_export_info_path: str = "/kaggle/working/nemotron_advanced/final_export_info.json"
+    snapshot_root_dir: str = "/kaggle/working/nemotron_advanced/snapshots"
+    best_score_epsilon: float = 1e-12
+    topk_min_global_step: int = 0
+    final_rerank_run_submission_style: bool = False
+    final_rerank_submission_rows: int = 128
+
     # ===== reproducibility =====
     seed: int = 3407
 
@@ -215,6 +227,8 @@ cfg.force_nemotron_torch_fallback = True
 Path(cfg.work_dir).mkdir(parents=True, exist_ok=True)
 Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
 Path(cfg.adapter_dir).mkdir(parents=True, exist_ok=True)
+Path(cfg.topk_candidate_dir).mkdir(parents=True, exist_ok=True)
+Path(cfg.snapshot_root_dir).mkdir(parents=True, exist_ok=True)
 
 assert cfg.lora_r <= cfg.max_lora_rank, "LoRA rank 超过比赛上限 32"
 assert cfg.max_seq_len <= cfg.official_max_model_len, "训练 max_seq_len 超过官方 max_model_len"
@@ -2520,22 +2534,125 @@ def summarize_template_disagreement(model: torch.nn.Module, df: pd.DataFrame, te
 
 
 class LocalAccuracyCallback(TrainerCallback):
-    def __init__(self, eval_df: pd.DataFrame, save_path: str, extractor_fn=fast_extract_prediction):
+    def __init__(
+        self,
+        eval_df: pd.DataFrame,
+        save_path: str,
+        extractor_fn=fast_extract_prediction,
+        save_top_k: int = 1,
+        candidates_dir: Optional[str] = None,
+        tokenizer=None,
+        metric_name: str = "local_accuracy",
+        min_global_step: int = 0,
+    ):
         self.eval_df = eval_df
         self.save_path = save_path
         self.extractor_fn = extractor_fn
         self.history: List[Dict[str, Any]] = []
 
+        self.save_top_k = max(int(save_top_k), 1)
+        self.candidates_dir = Path(candidates_dir) if candidates_dir is not None else None
+        self.tokenizer = tokenizer
+        self.metric_name = metric_name
+        self.min_global_step = int(min_global_step)
+
+        self.topk_candidates: List[Dict[str, Any]] = []
+
+        if self.candidates_dir is not None:
+            self.candidates_dir.mkdir(parents=True, exist_ok=True)
+
+    def _manifest_columns(self) -> List[str]:
+        return ["step", "local_accuracy", "candidate_dir"]
+
+    def _persist_topk_manifest(self) -> None:
+        manifest_path = Path(cfg.topk_candidate_manifest_path)
+        if self.topk_candidates:
+            out = pd.DataFrame(self.topk_candidates).sort_values(
+                ["local_accuracy", "step"],
+                ascending=[False, False],
+            )
+        else:
+            out = pd.DataFrame(columns=self._manifest_columns())
+        out.to_csv(manifest_path, index=False)
+
+    def _cleanup_non_topk_dirs(self) -> None:
+        if self.candidates_dir is None or not self.candidates_dir.exists():
+            return
+
+        keep_dirs = {str(Path(item["candidate_dir"])) for item in self.topk_candidates}
+        for path in self.candidates_dir.iterdir():
+            if path.is_dir() and str(path) not in keep_dirs:
+                shutil.rmtree(path, ignore_errors=True)
+
+    def _should_save_candidate(self, step: int, score: float) -> bool:
+        if step < self.min_global_step:
+            return False
+        if len(self.topk_candidates) < self.save_top_k:
+            return True
+
+        kth_score = min(float(item["local_accuracy"]) for item in self.topk_candidates)
+        return float(score) > kth_score + cfg.best_score_epsilon
+
+    def _save_topk_candidate(self, model: torch.nn.Module, step: int, score: float) -> None:
+        if self.candidates_dir is None or self.tokenizer is None:
+            return
+
+        candidate_dir = self.candidates_dir / f"step_{int(step):07d}_acc_{float(score):.6f}"
+        if candidate_dir.exists():
+            shutil.rmtree(candidate_dir, ignore_errors=True)
+        candidate_dir.mkdir(parents=True, exist_ok=True)
+
+        model.save_pretrained(candidate_dir)
+        self.tokenizer.save_pretrained(candidate_dir)
+
+        self.topk_candidates = [
+            item for item in self.topk_candidates
+            if int(item["step"]) != int(step)
+        ]
+        self.topk_candidates.append(
+            {
+                "step": int(step),
+                "local_accuracy": float(score),
+                "candidate_dir": str(candidate_dir),
+            }
+        )
+
+        self.topk_candidates = sorted(
+            self.topk_candidates,
+            key=lambda x: (-float(x["local_accuracy"]), -int(x["step"])),
+        )[: self.save_top_k]
+
+        self._cleanup_non_topk_dirs()
+        self._persist_topk_manifest()
+
+        print(
+            f"[top-k saved] metric={self.metric_name} "
+            f"step={step} score={score:.4f} "
+            f"kept={len(self.topk_candidates)}/{self.save_top_k}"
+        )
+
     def on_evaluate(self, args, state, control, model=None, **kwargs):
         acc, pred_df = evaluate_accuracy(model, self.eval_df, extractor_fn=self.extractor_fn)
-        record = {"step": int(state.global_step), "local_accuracy": acc}
+        record = {"step": int(state.global_step), "local_accuracy": float(acc)}
         self.history.append(record)
+
         pd.DataFrame(self.history).to_csv(self.save_path, index=False)
         pred_df.to_csv(Path(self.save_path).with_suffix(".preds.csv"), index=False)
+
         summaries = summarize_eval_metrics(pred_df)
         for key, value in summaries.items():
-            value.to_csv(Path(self.save_path).with_name(f"{Path(self.save_path).stem}_{key}_step_{state.global_step}.csv"), index=False)
+            value.to_csv(
+                Path(self.save_path).with_name(
+                    f"{Path(self.save_path).stem}_{key}_step_{state.global_step}.csv"
+                ),
+                index=False,
+            )
+
         print(f"\n[local-accuracy] step={state.global_step} acc={acc:.4f}")
+
+        if model is not None and self._should_save_candidate(int(state.global_step), float(acc)):
+            self._save_topk_candidate(model=model, step=int(state.global_step), score=float(acc))
+
         return control
 
 # %% [markdown]
@@ -2934,6 +3051,11 @@ def save_adapter_snapshot(model: torch.nn.Module, tokenizer, save_dir: str, tag:
 local_callback = LocalAccuracyCallback(
     eval_df=fast_eval_df,
     save_path=str(Path(cfg.work_dir) / "local_accuracy_history.csv"),
+    save_top_k=cfg.topk_candidate_keep,
+    candidates_dir=cfg.topk_candidate_dir,
+    tokenizer=tokenizer,
+    metric_name="local_accuracy",
+    min_global_step=cfg.topk_min_global_step,
 )
 
 if len(stage1_ds) > 0:
@@ -2949,7 +3071,12 @@ if len(stage1_ds) > 0:
     trainer_stage1.train()
 
     if cfg.save_stage1_snapshot:
-        save_adapter_snapshot(model, tokenizer, cfg.adapter_dir, tag="after_stage1_train")
+        save_adapter_snapshot(
+            model,
+            tokenizer,
+            str(Path(cfg.snapshot_root_dir) / "after_stage1_train"),
+            tag="after_stage1_train",
+        )
         cleanup_cuda()
 else:
     print("skip stage1: no samples after curriculum filter")
@@ -3097,7 +3224,12 @@ model, stage2_last_pred_df, replay_buffer = train_stage2_with_reweight(
 
 # Cell 21.5
 if cfg.save_final_snapshot_before_post_eval:
-    save_adapter_snapshot(model, tokenizer, cfg.adapter_dir, tag="after_stage2_train")
+    save_adapter_snapshot(
+        model,
+        tokenizer,
+        str(Path(cfg.snapshot_root_dir) / "after_stage2_train"),
+        tag="after_stage2_train",
+    )
     cleanup_cuda()
 
 # Cell 22A
@@ -3229,6 +3361,211 @@ if cfg.run_post_train_heavy_eval:
 else:
     print("skip post-train template disagreement (disabled by cfg)")
 
+
+
+# Cell 22.9
+def load_backbone_model_for_adapter_eval() -> torch.nn.Module:
+    cleanup_cuda_before_model_load()
+
+    quant_config = build_quant_config()
+    attn_implementation = resolve_attn_implementation()
+
+    attempt_specs: List[Dict[str, Any]] = []
+    if quant_config is not None:
+        attempt_specs.append(
+            {
+                "label": "candidate_eval_quantized",
+                "quant_config": quant_config,
+                "attn_implementation": attn_implementation,
+            }
+        )
+
+    attempt_specs.append(
+        {
+            "label": "candidate_eval_nonquant_fallback",
+            "quant_config": None,
+            "attn_implementation": attn_implementation,
+        }
+    )
+
+    errors: List[str] = []
+    base_model: Optional[torch.nn.Module] = None
+
+    for spec in attempt_specs:
+        cleanup_cuda_before_model_load(verbose=True)
+        try:
+            print(f"[candidate-reload] trying load mode: {spec['label']}")
+            base_model = AutoModelForCausalLM.from_pretrained(
+                cfg.base_model,
+                **build_model_load_kwargs(
+                    quant_config=spec["quant_config"],
+                    attn_implementation=spec["attn_implementation"],
+                ),
+            )
+            break
+        except Exception as exc:
+            errors.append(f"{spec['label']}: {type(exc).__name__}: {exc}")
+            if base_model is not None:
+                try:
+                    del base_model
+                except Exception:
+                    pass
+                base_model = None
+            gc.collect()
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                try:
+                    torch.cuda.ipc_collect()
+                except Exception:
+                    pass
+
+    if base_model is None:
+        raise RuntimeError(
+            "Unable to reload base model for candidate evaluation.\n"
+            "Attempts:\n" + "\n".join(errors)
+        )
+
+    force_nemotron_torch_fallback(base_model, tag="candidate_eval_backbone")
+    base_model.config.use_cache = False
+    base_model.eval()
+    return base_model
+
+
+def load_candidate_adapter_for_eval(adapter_dir: str) -> torch.nn.Module:
+    backbone = load_backbone_model_for_adapter_eval()
+    candidate_model = PeftModel.from_pretrained(
+        backbone,
+        adapter_dir,
+        is_trainable=False,
+    )
+    force_nemotron_torch_fallback(candidate_model, tag=f"candidate_eval::{Path(adapter_dir).name}")
+    candidate_model.config.use_cache = False
+    candidate_model.eval()
+    return candidate_model
+
+
+def summarize_multi_seed_result(multi_seed_df: pd.DataFrame) -> Dict[str, float]:
+    if multi_seed_df is None or multi_seed_df.empty:
+        return {
+            "multi_seed_mean_accuracy": float("nan"),
+            "multi_seed_accuracy_std": float("nan"),
+        }
+
+    summary_row = multi_seed_df.loc[multi_seed_df["seed"].astype(str) == "mean±std"]
+    if len(summary_row):
+        row = summary_row.iloc[0]
+        return {
+            "multi_seed_mean_accuracy": float(row.get("accuracy", np.nan)),
+            "multi_seed_accuracy_std": float(row.get("accuracy_std", np.nan)),
+        }
+
+    return {
+        "multi_seed_mean_accuracy": float(multi_seed_df["accuracy"].mean()),
+        "multi_seed_accuracy_std": float(multi_seed_df["accuracy"].std(ddof=0)),
+    }
+
+
+def load_topk_candidate_manifest() -> pd.DataFrame:
+    manifest_path = Path(cfg.topk_candidate_manifest_path)
+    if not manifest_path.exists():
+        return pd.DataFrame(columns=["step", "local_accuracy", "candidate_dir"])
+
+    out = pd.read_csv(manifest_path)
+    if out.empty:
+        return out
+
+    out = out.loc[out["candidate_dir"].map(lambda p: Path(p).exists())].copy()
+    return out.sort_values(["local_accuracy", "step"], ascending=[False, False]).reset_index(drop=True)
+
+
+def rerank_topk_candidates(candidate_df: pd.DataFrame) -> pd.DataFrame:
+    if candidate_df.empty:
+        return pd.DataFrame()
+
+    rows = []
+    rerank_eval_df = serious_eval_df.copy()
+
+    if cfg.final_rerank_run_submission_style:
+        rerank_submission_df = rerank_eval_df.head(min(len(rerank_eval_df), cfg.final_rerank_submission_rows))
+    else:
+        rerank_submission_df = pd.DataFrame()
+
+    total = len(candidate_df)
+    for idx, cand in enumerate(candidate_df.itertuples(index=False), start=1):
+        candidate_dir = str(cand.candidate_dir)
+        print(
+            f"\n[final-rerank] candidate {idx}/{total} | "
+            f"step={cand.step} | local_acc={cand.local_accuracy:.4f} | dir={candidate_dir}"
+        )
+
+        candidate_model = load_candidate_adapter_for_eval(candidate_dir)
+
+        serious_acc, serious_pred_df, serious_multi_seed_df = run_serious_eval_suite(
+            candidate_model,
+            rerank_eval_df,
+            serious_eval_views,
+            prefix=f"final_rerank_{Path(candidate_dir).name}",
+            run_multi_seed=True,
+        )
+
+        multi_seed_summary = summarize_multi_seed_result(serious_multi_seed_df)
+
+        if cfg.final_rerank_run_submission_style and not rerank_submission_df.empty:
+            submission_style_acc, _ = offline_submission_style_eval(
+                candidate_model,
+                rerank_submission_df,
+                top_k=cfg.test_time_router_top_k,
+            )
+        else:
+            submission_style_acc = float("nan")
+
+        rows.append(
+            {
+                "step": int(cand.step),
+                "local_accuracy": float(cand.local_accuracy),
+                "candidate_dir": candidate_dir,
+                "serious_accuracy": float(serious_acc),
+                "multi_seed_mean_accuracy": float(multi_seed_summary["multi_seed_mean_accuracy"]),
+                "multi_seed_accuracy_std": float(multi_seed_summary["multi_seed_accuracy_std"]),
+                "submission_style_accuracy": float(submission_style_acc),
+            }
+        )
+
+        try:
+            del candidate_model
+        except Exception:
+            pass
+        cleanup_cuda()
+
+    report_df = pd.DataFrame(rows)
+
+    sort_columns = [
+        "serious_accuracy",
+        "multi_seed_mean_accuracy",
+        "multi_seed_accuracy_std",
+        "local_accuracy",
+        "step",
+    ]
+    sort_ascending = [False, False, True, False, False]
+
+    if cfg.final_rerank_run_submission_style:
+        sort_columns = [
+            "serious_accuracy",
+            "submission_style_accuracy",
+            "multi_seed_mean_accuracy",
+            "multi_seed_accuracy_std",
+            "local_accuracy",
+            "step",
+        ]
+        sort_ascending = [False, False, False, True, False, False]
+
+    report_df = report_df.sort_values(sort_columns, ascending=sort_ascending).reset_index(drop=True)
+    report_df["final_pick_rank"] = np.arange(1, len(report_df) + 1)
+    return report_df
+
 # %% [markdown]
 # ## Cell 23 — 保存 LoRA adapter，并检查 rank/配置是否合法
 # 
@@ -3236,17 +3573,43 @@ else:
 # 这里显式校验 `adapter_config.json`，避免训练完才发现不能交。
 
 # %%
-model.save_pretrained(cfg.adapter_dir)
-tokenizer.save_pretrained(cfg.adapter_dir)
+final_adapter_dir = Path(cfg.adapter_dir)
+if final_adapter_dir.exists():
+    shutil.rmtree(final_adapter_dir, ignore_errors=True)
 
-adapter_cfg_path = Path(cfg.adapter_dir) / "adapter_config.json"
+topk_candidate_df = load_topk_candidate_manifest()
+
+if not topk_candidate_df.empty:
+    rerank_report_df = rerank_topk_candidates(topk_candidate_df)
+    rerank_report_df.to_csv(Path(cfg.final_rerank_report_path), index=False)
+
+    winner = rerank_report_df.iloc[0].to_dict()
+    winner_dir = Path(winner["candidate_dir"])
+
+    shutil.copytree(winner_dir, final_adapter_dir)
+
+    Path(cfg.final_export_info_path).write_text(
+        json.dumps(winner, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    print("[final export] selected winner from top-k candidates:")
+    print(json.dumps(winner, ensure_ascii=False, indent=2))
+else:
+    print("[final export] no top-k candidates found; fallback to current in-memory model")
+    final_adapter_dir.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(final_adapter_dir)
+    tokenizer.save_pretrained(final_adapter_dir)
+
+adapter_cfg_path = final_adapter_dir / "adapter_config.json"
 assert adapter_cfg_path.exists(), "缺少 adapter_config.json，无法提交"
+
 with open(adapter_cfg_path, "r", encoding="utf-8") as f:
     adapter_cfg = json.load(f)
 
 assert int(adapter_cfg.get("r", cfg.lora_r)) <= cfg.max_lora_rank, "导出的 LoRA rank 超过比赛限制"
 print(json.dumps(adapter_cfg, ensure_ascii=False, indent=2)[:1200])
-print("adapter files:", sorted(p.name for p in Path(cfg.adapter_dir).iterdir()))
+print("adapter files:", sorted(p.name for p in final_adapter_dir.iterdir()))
 
 # %% [markdown]
 # ## Cell 24 — 打包 submission.zip
