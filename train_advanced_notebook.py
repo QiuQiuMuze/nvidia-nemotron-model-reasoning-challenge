@@ -185,6 +185,15 @@ class CFG:
     hard_mining_sample_boost: float = 0.60
     replay_probe_rows: int = 128
     allow_target_auto_discovery: bool = False
+
+    # ===== runtime control =====
+    run_stage1_multi_seed_eval: bool = False
+    run_stage1_submission_style_eval: bool = False
+    run_post_train_heavy_eval: bool = False
+    save_stage1_snapshot: bool = True
+    save_final_snapshot_before_post_eval: bool = True
+    post_eval_fail_open: bool = True
+
     target_modules_final: Tuple[str, ...] = (
         "q_proj",
         "k_proj",
@@ -201,6 +210,7 @@ class CFG:
     )
 
 cfg = CFG()
+cfg.force_nemotron_torch_fallback = True
 
 Path(cfg.work_dir).mkdir(parents=True, exist_ok=True)
 Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
@@ -545,8 +555,6 @@ def safe_numeric_eval(expr: str) -> Optional[float]:
             if isinstance(node.value, (int, float)):
                 return float(node.value)
             raise ValueError('bad constant')
-        if isinstance(node, ast.Num):
-            return float(node.n)
         if isinstance(node, ast.BinOp) and type(node.op) in SAFE_EVAL_BIN_OPS:
             return SAFE_EVAL_BIN_OPS[type(node.op)](_eval(node.left), _eval(node.right))
         if isinstance(node, ast.UnaryOp) and type(node.op) in SAFE_EVAL_UNARY_OPS:
@@ -1336,9 +1344,22 @@ def force_nemotron_torch_fallback(model: torch.nn.Module, tag: str = "") -> int:
 if cfg.force_nemotron_torch_fallback:
     disable_nemotron_fast_path_globally()
 # %% [markdown]
-# ## Cell 13 — 加载基座模型 + 自动发现 LoRA target modules（离线稳定版）
+# ## Cell 13 — 稳定版模型加载 + LoRA target 自动发现 + OOM 清理
 
 # %%
+import gc
+import math
+import os
+import importlib
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+
+# 这里直接兜底打开补丁开关，防止你前面忘了设
+cfg.force_nemotron_torch_fallback = True
+
+# 加载时保守一点，避免 max_memory 估计过激进
+cfg.cuda_load_headroom_gib = max(12, int(getattr(cfg, "cuda_load_headroom_gib", 12)))
+
+
 def discover_lora_targets(named_modules: Iterable[Tuple[str, torch.nn.Module]]) -> List[str]:
     candidates = []
     wanted_suffixes = {
@@ -1366,6 +1387,26 @@ def package_available(package_name: str) -> bool:
     return importlib.util.find_spec(package_name) is not None
 
 
+def cleanup_cuda_before_model_load(verbose: bool = True) -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        if verbose:
+            print(
+                f"CUDA free before load: "
+                f"{free_bytes / (1024 ** 3):.2f} / {total_bytes / (1024 ** 3):.2f} GiB"
+            )
+
+
 def build_quant_config() -> Optional[BitsAndBytesConfig]:
     if not cfg.use_4bit:
         return None
@@ -1383,36 +1424,41 @@ def build_quant_config() -> Optional[BitsAndBytesConfig]:
 
 
 def resolve_attn_implementation() -> Optional[str]:
+    # 保守稳定路径，避免额外 kernel 问题
     return "eager"
 
-
-from typing import Dict, Optional, Union
 
 def build_model_max_memory() -> Optional[Dict[Union[int, str], str]]:
     if not torch.cuda.is_available():
         return None
 
     max_memory: Dict[Union[int, str], str] = {}
-    reserve_gib = max(1, int(cfg.cuda_load_headroom_gib))
+    reserve_gib = max(4, int(cfg.cuda_load_headroom_gib))
 
     for device_idx in range(torch.cuda.device_count()):
-        total_gib = torch.cuda.get_device_properties(device_idx).total_memory / (1024 ** 3)
-        usable_gib = max(1, math.floor(total_gib - reserve_gib))
-        max_memory[device_idx] = f"{usable_gib}GiB"   # 关键：不要用 str(device_idx)
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device_idx)
+        free_gib = free_bytes / (1024 ** 3)
+        total_gib = total_bytes / (1024 ** 3)
+
+        # 用“当前空闲显存”而不是“总显存”估计
+        usable_gib = max(1, math.floor(min(free_gib, total_gib) - reserve_gib))
+        max_memory[device_idx] = f"{usable_gib}GiB"
 
     if hasattr(os, "sysconf") and "SC_PAGE_SIZE" in os.sysconf_names and "SC_PHYS_PAGES" in os.sysconf_names:
         total_cpu_gib = (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")) / (1024 ** 3)
-        cpu_usable = max(8, math.floor(total_cpu_gib - 8))
+        cpu_usable = max(16, math.floor(total_cpu_gib - 8))
         max_memory["cpu"] = f"{cpu_usable}GiB"
 
+    print("max_memory plan:", max_memory)
     return max_memory
+
 
 def build_model_load_kwargs(
     quant_config: Optional[BitsAndBytesConfig],
     attn_implementation: Optional[str],
 ) -> Dict[str, Any]:
     load_kwargs: Dict[str, Any] = {
-        "torch_dtype": torch.bfloat16 if cfg.use_bf16 else torch.float16,
+        "dtype": torch.bfloat16 if cfg.use_bf16 else torch.float16,
         "trust_remote_code": False,
         "local_files_only": True,
         "low_cpu_mem_usage": True,
@@ -1436,27 +1482,39 @@ def build_model_load_kwargs(
 
 
 def load_training_model() -> Tuple[torch.nn.Module, List[str]]:
+    cleanup_cuda_before_model_load()
+
     quant_config = build_quant_config()
     attn_implementation = resolve_attn_implementation()
 
-    attempt_specs = [
-        {
-            "label": "quantized_eager_builtin" if quant_config is not None else "fp16_or_bf16_eager_builtin",
-            "quant_config": quant_config,
-            "attn_implementation": attn_implementation,
-        },
+    attempt_specs: List[Dict[str, Any]] = []
+
+    # 只有真的有 4-bit 配置时，才尝试量化加载
+    if quant_config is not None:
+        attempt_specs.append(
+            {
+                "label": "quantized_eager_builtin",
+                "quant_config": quant_config,
+                "attn_implementation": attn_implementation,
+            }
+        )
+
+    # 永远保留一个非量化 fallback
+    attempt_specs.append(
         {
             "label": "fp16_or_bf16_eager_builtin_fallback",
             "quant_config": None,
             "attn_implementation": attn_implementation,
-        },
-    ]
+        }
+    )
 
     errors: List[str] = []
-    model = None
+    model: Optional[torch.nn.Module] = None
     used_spec: Optional[Dict[str, Any]] = None
 
     for spec in attempt_specs:
+        cleanup_cuda_before_model_load(verbose=True)
+
         try:
             print(f"Trying load mode: {spec['label']}")
             model = AutoModelForCausalLM.from_pretrained(
@@ -1468,8 +1526,27 @@ def load_training_model() -> Tuple[torch.nn.Module, List[str]]:
             )
             used_spec = spec
             break
+
         except Exception as exc:
             errors.append(f"{spec['label']}: {type(exc).__name__}: {exc}")
+
+            if model is not None:
+                try:
+                    del model
+                except Exception:
+                    pass
+                model = None
+
+            gc.collect()
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                try:
+                    torch.cuda.ipc_collect()
+                except Exception:
+                    pass
 
     if model is None:
         raise RuntimeError(
@@ -1488,21 +1565,20 @@ def load_training_model() -> Tuple[torch.nn.Module, List[str]]:
         },
     )
 
-    # 第一次：模型刚 load 完立刻强制 fallback
+    # 1) 刚加载完先打一次 Nemotron fallback 补丁
     force_nemotron_torch_fallback(model, tag="after_load")
 
     model.config.use_cache = False
 
+    # 2) 只有真的量化加载了，才做 k-bit prepare
     if used_spec["quant_config"] is not None:
         model = prepare_model_for_kbit_training(model)
-        # 第二次：k-bit 预处理后再补一次，防止 wrapper/替换后丢补丁
         force_nemotron_torch_fallback(model, tag="after_kbit_prepare")
 
-    # 某些 k-bit / PEFT 训练场景下，需要让输入支持梯度
+    # 某些场景下需要输入支持梯度
     if hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
 
-    # 当前环境下不启用 gradient checkpointing
     supports_gc = bool(getattr(model, "supports_gradient_checkpointing", False))
     if cfg.enable_gradient_checkpointing and supports_gc:
         model.gradient_checkpointing_enable()
@@ -1535,7 +1611,7 @@ def load_training_model() -> Tuple[torch.nn.Module, List[str]]:
 
     model = get_peft_model(model, lora_config)
 
-    # 第三次：PEFT 包装后再补一次，确保训练时真正调用到的模块也不会回到 fast CUDA path
+    # 3) PEFT 包装后再补一次，防止真正训练对象回到 fast CUDA path
     force_nemotron_torch_fallback(model, tag="after_peft")
 
     return model, lora_targets
@@ -1544,6 +1620,7 @@ def load_training_model() -> Tuple[torch.nn.Module, List[str]]:
 model, lora_targets = load_training_model()
 print("LoRA targets:", lora_targets)
 model.print_trainable_parameters()
+
 # %% [markdown]
 # ## Cell 14 — 自定义 sampler：family reweight + length bonus + difficulty curriculum
 # 
@@ -1687,18 +1764,32 @@ print("train replay probe subset:", train_replay_probe_df.shape)
 
 @torch.no_grad()
 def generate_answer_text(model: torch.nn.Module, prompt: str, max_new_tokens: int = 96) -> str:
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    input_len = inputs["input_ids"].shape[1]
+    prev_training = model.training
+    prev_use_cache = getattr(model.config, "use_cache", None)
 
-    outputs = model.generate(
-        **inputs,
-        max_new_tokens=max_new_tokens,
-        do_sample=False,
-        pad_token_id=tokenizer.eos_token_id,
-    )
+    try:
+        model.eval()
+        if prev_use_cache is not None:
+            model.config.use_cache = True
 
-    gen_ids = outputs[0][input_len:]
-    return tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+        input_len = inputs["input_ids"].shape[1]
+
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+
+        gen_ids = outputs[0][input_len:]
+        return tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+
+    finally:
+        if prev_use_cache is not None:
+            model.config.use_cache = prev_use_cache
+        if prev_training:
+            model.train()
 
 
 @torch.no_grad()
@@ -1964,14 +2055,20 @@ def run_serious_eval_suite(
     eval_views: Dict[int, pd.DataFrame],
     prefix: str,
     extractor_fn=metric_extract_prediction,
+    run_multi_seed: bool = True,
 ) -> Tuple[float, pd.DataFrame, pd.DataFrame]:
     primary_acc, primary_pred_df = evaluate_accuracy(model, primary_df, extractor_fn=extractor_fn)
     print(f"{prefix} serious accuracy: {primary_acc:.4f}")
     print_eval_summaries(primary_pred_df, prefix=prefix)
-    multi_seed_df = evaluate_multi_seed_views(model, eval_views, extractor_fn=extractor_fn)
-    display(multi_seed_df)
     primary_pred_df.to_csv(Path(cfg.work_dir) / f"{prefix}_predictions.csv", index=False)
-    multi_seed_df.to_csv(Path(cfg.work_dir) / f"{prefix}_multi_seed_eval.csv", index=False)
+
+    if run_multi_seed and eval_views:
+        multi_seed_df = evaluate_multi_seed_views(model, eval_views, extractor_fn=extractor_fn)
+        display(multi_seed_df)
+        multi_seed_df.to_csv(Path(cfg.work_dir) / f"{prefix}_multi_seed_eval.csv", index=False)
+    else:
+        multi_seed_df = pd.DataFrame()
+
     return primary_acc, primary_pred_df, multi_seed_df
 
 
@@ -2813,6 +2910,23 @@ template_score_df = pd.DataFrame()
 family_template_map_df = pd.DataFrame(columns=["prompt_family", "best_template_id", "best_accuracy", "family_rows"])
 template_update_decisions_df = pd.DataFrame()
 
+
+
+# Cell 18.5
+def cleanup_cuda() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def save_adapter_snapshot(model: torch.nn.Module, tokenizer, save_dir: str, tag: str = "") -> None:
+    save_path = Path(save_dir)
+    save_path.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(save_path)
+    tokenizer.save_pretrained(save_path)
+    print(f"[snapshot saved] {save_path}" + (f" ({tag})" if tag else ""))
+
+
 # %% [markdown]
 # ## Cell 19 — Stage 1 训练（短 / 规则明显 family 先收敛）
 
@@ -2833,6 +2947,10 @@ if len(stage1_ds) > 0:
         callbacks=[local_callback],
     )
     trainer_stage1.train()
+
+    if cfg.save_stage1_snapshot:
+        save_adapter_snapshot(model, tokenizer, cfg.adapter_dir, tag="after_stage1_train")
+        cleanup_cuda()
 else:
     print("skip stage1: no samples after curriculum filter")
 
@@ -2851,14 +2969,21 @@ stage1_acc, stage1_pred_df, stage1_multi_seed_df = run_serious_eval_suite(
     serious_eval_df,
     serious_eval_views,
     prefix="stage1_valid",
+    run_multi_seed=cfg.run_stage1_multi_seed_eval,
 )
-stage1_submission_style_acc, stage1_submission_style_df = offline_submission_style_eval(
-    model,
-    serious_eval_df.head(min(len(serious_eval_df), 128)),
-    top_k=cfg.test_time_router_top_k,
-)
-print(f"stage1 submission-style accuracy: {stage1_submission_style_acc:.4f}")
-stage1_submission_style_df.to_csv(Path(cfg.work_dir) / "stage1_submission_style_eval.csv", index=False)
+
+if cfg.run_stage1_submission_style_eval:
+    stage1_submission_style_acc, stage1_submission_style_df = offline_submission_style_eval(
+        model,
+        serious_eval_df.head(min(len(serious_eval_df), 128)),
+        top_k=cfg.test_time_router_top_k,
+    )
+    print(f"stage1 submission-style accuracy: {stage1_submission_style_acc:.4f}")
+    stage1_submission_style_df.to_csv(Path(cfg.work_dir) / "stage1_submission_style_eval.csv", index=False)
+else:
+    stage1_submission_style_acc = None
+    stage1_submission_style_df = pd.DataFrame()
+    print("skip stage1 submission-style eval (disabled by cfg)")
 
 stage1_train_probe_acc, stage1_train_probe_pred_df = evaluate_accuracy(
     model,
@@ -2867,9 +2992,14 @@ stage1_train_probe_acc, stage1_train_probe_pred_df = evaluate_accuracy(
 )
 print(f"stage1 train replay probe accuracy: {stage1_train_probe_acc:.4f}")
 stage1_train_probe_pred_df.to_csv(Path(cfg.work_dir) / "stage1_train_probe_predictions.csv", index=False)
+
 replay_buffer = update_replay_buffer({}, stage1_train_probe_pred_df)
 print("bootstrapped replay buffer size:", len(replay_buffer))
-CURRENT_WEAK_FAMILIES[:] = get_weak_families_from_pred_df(stage1_pred_df, top_k=cfg.stage2_refresh_weak_family_top_k)
+
+CURRENT_WEAK_FAMILIES[:] = get_weak_families_from_pred_df(
+    stage1_pred_df,
+    top_k=cfg.stage2_refresh_weak_family_top_k,
+)
 print("current weak families after stage1:", CURRENT_WEAK_FAMILIES)
 
 if cfg.enable_prompt_template_ablation:
@@ -2906,8 +3036,14 @@ print("refreshed valid records:", valid_records.shape)
 print("updated stage2 weight summary:", np.quantile(stage2_weights, [0, 0.25, 0.5, 0.75, 1]))
 
 hard_profile = build_hard_profile(stage1_pred_df)
-stage2_weights = compute_sample_weights(stage2_records, hard_profile=hard_profile, replay_buffer=replay_buffer)
+stage2_weights = compute_sample_weights(
+    stage2_records,
+    hard_profile=hard_profile,
+    replay_buffer=replay_buffer,
+)
 print("stage2 weight summary after hard profile + replay bootstrap:", np.quantile(stage2_weights, [0, 0.25, 0.5, 0.75, 1]))
+
+
 # %% [markdown]
 # ## Cell 21 — Stage 2 训练（多轮重加权，而非轮间重建数据资产）
 
@@ -2958,37 +3094,140 @@ model, stage2_last_pred_df, replay_buffer = train_stage2_with_reweight(
     refresh_assets_fn=refresh_stage2_assets_for_round,
 )
 
-# %% [markdown]
-# ## Cell 22 — 训练后本地近似评估 + 分组报表
 
-# %%
-post_acc, post_pred_df, post_multi_seed_df = run_serious_eval_suite(
-    model,
-    serious_eval_df,
-    serious_eval_views,
-    prefix="post_train_valid",
-)
-display(post_pred_df.head(10))
+# Cell 21.5
+if cfg.save_final_snapshot_before_post_eval:
+    save_adapter_snapshot(model, tokenizer, cfg.adapter_dir, tag="after_stage2_train")
+    cleanup_cuda()
 
-submission_style_acc, submission_style_df = offline_submission_style_eval(
-    model,
-    serious_eval_df.head(min(len(serious_eval_df), 128)),
-    top_k=cfg.test_time_router_top_k,
-)
-print(f"post-train submission-style accuracy: {submission_style_acc:.4f}")
-display(submission_style_df.head(10))
-submission_style_df.to_csv(Path(cfg.work_dir) / "post_train_submission_style_eval.csv", index=False)
-completion_sanity_df = inspect_generation_completion_sanity(model, serious_eval_df, rows=min(len(serious_eval_df), 3))
-display(completion_sanity_df)
-completion_sanity_df.to_csv(Path(cfg.work_dir) / "post_train_generation_completion_sanity.csv", index=False)
+# Cell 22A
+def safe_post_eval_block(name: str, fn, fail_open: bool = True):
+    print(f"\n[post-eval:start] {name}")
+    try:
+        result = fn()
+        print(f"[post-eval:done] {name}")
+        cleanup_cuda()
+        return result
+    except Exception as e:
+        cleanup_cuda()
+        if fail_open:
+            print(f"[post-eval:skip] {name} failed: {type(e).__name__}: {e}")
+            return None
+        raise
 
-consensus_acc, consensus_df = evaluate_with_consensus(model, serious_eval_df.head(min(len(serious_eval_df), 128)), cfg.test_time_template_candidates)
-print(f"post-train consensus accuracy: {consensus_acc:.4f}")
-display(consensus_df.head(10))
-consensus_df.to_csv(Path(cfg.work_dir) / "post_train_consensus_predictions.csv", index=False)
-template_disagreement_df = summarize_template_disagreement(model, serious_eval_df, cfg.test_time_template_candidates, max_rows=128)
-display(template_disagreement_df.head(20))
-template_disagreement_df.to_csv(Path(cfg.work_dir) / "template_disagreement_by_family.csv", index=False)
+# Cell 22B
+if cfg.run_post_train_heavy_eval:
+    serious_result = safe_post_eval_block(
+        "post_train_serious_eval",
+        lambda: run_serious_eval_suite(
+            model,
+            serious_eval_df,
+            serious_eval_views,
+            prefix="post_train_valid",
+            run_multi_seed=True,
+        ),
+        fail_open=cfg.post_eval_fail_open,
+    )
+
+    if serious_result is not None:
+        post_acc, post_pred_df, post_multi_seed_df = serious_result
+        display(post_pred_df.head(10))
+    else:
+        post_acc, post_pred_df, post_multi_seed_df = None, pd.DataFrame(), pd.DataFrame()
+else:
+    print("skip post-train serious eval (disabled by cfg)")
+
+
+# Cell 22C
+
+if cfg.run_post_train_heavy_eval:
+    submission_style_result = safe_post_eval_block(
+        "post_train_submission_style_eval",
+        lambda: offline_submission_style_eval(
+            model,
+            serious_eval_df.head(min(len(serious_eval_df), 128)),
+            top_k=cfg.test_time_router_top_k,
+        ),
+        fail_open=cfg.post_eval_fail_open,
+    )
+
+    if submission_style_result is not None:
+        submission_style_acc, submission_style_df = submission_style_result
+        print(f"post-train submission-style accuracy: {submission_style_acc:.4f}")
+        display(submission_style_df.head(10))
+        submission_style_df.to_csv(Path(cfg.work_dir) / "post_train_submission_style_eval.csv", index=False)
+    else:
+        submission_style_acc, submission_style_df = None, pd.DataFrame()
+else:
+    print("skip post-train submission-style eval (disabled by cfg)")
+
+
+# Cell 22 D
+if cfg.run_post_train_heavy_eval:
+    completion_sanity_result = safe_post_eval_block(
+        "post_train_completion_sanity",
+        lambda: inspect_generation_completion_sanity(
+            model,
+            serious_eval_df,
+            rows=min(len(serious_eval_df), 3),
+        ),
+        fail_open=cfg.post_eval_fail_open,
+    )
+
+    if completion_sanity_result is not None:
+        completion_sanity_df = completion_sanity_result
+        display(completion_sanity_df)
+        completion_sanity_df.to_csv(Path(cfg.work_dir) / "post_train_generation_completion_sanity.csv", index=False)
+    else:
+        completion_sanity_df = pd.DataFrame()
+else:
+    print("skip post-train completion sanity (disabled by cfg)")
+
+
+# Cell 22E
+
+if cfg.run_post_train_heavy_eval:
+    consensus_result = safe_post_eval_block(
+        "post_train_consensus_eval",
+        lambda: evaluate_with_consensus(
+            model,
+            serious_eval_df.head(min(len(serious_eval_df), 128)),
+            cfg.test_time_template_candidates,
+        ),
+        fail_open=cfg.post_eval_fail_open,
+    )
+
+    if consensus_result is not None:
+        consensus_acc, consensus_df = consensus_result
+        print(f"post-train consensus accuracy: {consensus_acc:.4f}")
+        display(consensus_df.head(10))
+        consensus_df.to_csv(Path(cfg.work_dir) / "post_train_consensus_predictions.csv", index=False)
+    else:
+        consensus_acc, consensus_df = None, pd.DataFrame()
+else:
+    print("skip post-train consensus eval (disabled by cfg)")
+
+#Cell 22F
+if cfg.run_post_train_heavy_eval:
+    template_disagreement_result = safe_post_eval_block(
+        "post_train_template_disagreement",
+        lambda: summarize_template_disagreement(
+            model,
+            serious_eval_df,
+            cfg.test_time_template_candidates,
+            max_rows=128,
+        ),
+        fail_open=cfg.post_eval_fail_open,
+    )
+
+    if template_disagreement_result is not None:
+        template_disagreement_df = template_disagreement_result
+        display(template_disagreement_df.head(20))
+        template_disagreement_df.to_csv(Path(cfg.work_dir) / "template_disagreement_by_family.csv", index=False)
+    else:
+        template_disagreement_df = pd.DataFrame()
+else:
+    print("skip post-train template disagreement (disabled by cfg)")
 
 # %% [markdown]
 # ## Cell 23 — 保存 LoRA adapter，并检查 rank/配置是否合法
