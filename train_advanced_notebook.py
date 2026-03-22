@@ -4027,6 +4027,82 @@ print("submission zip:", zip_path)
 print("files packed:", sorted(found))
 print("zip size (MB):", round(zip_path.stat().st_size / 1024 / 1024, 3))
 
+# Cell 24.1
+def release_training_objects_before_reload() -> None:
+    global model, trainer_stage1, trainer_stage2, collator
+
+    print("[smoke] releasing training objects before adapter reload")
+
+    # 先断开 collator 对旧 model 的隐藏引用
+    if "collator" in globals() and collator is not None:
+        try:
+            if hasattr(collator, "model"):
+                collator.model = None
+        except Exception:
+            pass
+        try:
+            del collator
+        except Exception:
+            pass
+
+    # 删除可能还在的 trainer
+    for trainer_name in ("trainer_stage1", "trainer_stage2"):
+        if trainer_name in globals():
+            try:
+                trainer_obj = globals()[trainer_name]
+
+                # 尽量断开 trainer 内部对 model 的引用
+                try:
+                    if hasattr(trainer_obj, "model"):
+                        trainer_obj.model = None
+                except Exception:
+                    pass
+                try:
+                    if hasattr(trainer_obj, "model_wrapped"):
+                        trainer_obj.model_wrapped = None
+                except Exception:
+                    pass
+                try:
+                    if hasattr(trainer_obj, "optimizer"):
+                        trainer_obj.optimizer = None
+                except Exception:
+                    pass
+                try:
+                    if hasattr(trainer_obj, "lr_scheduler"):
+                        trainer_obj.lr_scheduler = None
+                except Exception:
+                    pass
+
+                del globals()[trainer_name]
+            except Exception:
+                pass
+
+    # 删除主模型
+    if "model" in globals():
+        try:
+            old_model = model
+            del model
+            del old_model
+        except Exception:
+            pass
+
+    gc.collect()
+
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        print(
+            f"[smoke] CUDA free after release: "
+            f"{free_bytes / (1024 ** 3):.2f} / {total_bytes / (1024 ** 3):.2f} GiB"
+        )
 
 # Cell 24.5
 def smoke_reload_exported_adapter_check(
@@ -4058,11 +4134,22 @@ def smoke_reload_exported_adapter_check(
 
 # Cell 24.9
 if cfg.smoke_test_mode and cfg.smoke_profile == "pipeline" and cfg.smoke_run_export_reload_check:
-    smoke_reload_df = smoke_reload_exported_adapter_check(
-        final_adapter_dir,
-        fast_eval_df,
-        rows=cfg.smoke_export_reload_rows,
+    # 关键：先释放训练期那份大模型，不然 reload 会在同进程里挤两份 30B
+    release_training_objects_before_reload()
+
+    print(f"[smoke] reload exported adapter from: {final_adapter_dir}")
+
+    # 直接把 reload 后的模型重新赋给 model，后面 Cell 25 继续复用它
+    model = load_candidate_adapter_for_eval(str(final_adapter_dir))
+
+    probe_subset = fast_eval_df.head(min(cfg.smoke_export_reload_rows, len(fast_eval_df))).copy()
+    smoke_reload_acc, smoke_reload_df = evaluate_accuracy(
+        model,
+        probe_subset,
+        extractor_fn=fast_extract_prediction,
     )
+
+    print(f"[smoke] reloaded-adapter probe accuracy: {smoke_reload_acc:.4f}")
     display(smoke_reload_df.head(10))
     smoke_reload_df.to_csv(
         Path(cfg.work_dir) / "smoke_reloaded_adapter_probe.csv",
