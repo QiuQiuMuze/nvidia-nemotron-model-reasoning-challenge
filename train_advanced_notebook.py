@@ -196,6 +196,8 @@ class CFG:
     hard_mining_bucket_boost: float = 0.15
     hard_mining_sample_boost: float = 0.60
     replay_probe_rows: int = 128
+    short_text_weight_boost: float = 1.25
+    open_template_short_text_extra_boost: float = 1.10
     allow_target_auto_discovery: bool = False
 
     # ===== runtime control =====
@@ -928,7 +930,9 @@ def template_text(problem: str) -> str:
     return textwrap.dedent(
         f"""\
         <system>
-        Infer the hidden rule from the examples. Reason briefly and return only the final text answer in \\boxed{{}}.
+        Infer the hidden rule from the examples.
+        Return the shortest exact final text answer only in \\boxed{{}}.
+        No explanation, no paraphrase, no extra words, no full sentence.
         </system>
         <user>
         {problem}
@@ -953,16 +957,16 @@ FAMILY_TEMPLATE_PRIORS: Dict[str, str] = {
     "fewshot_pattern": "T3_hidden_reasoning",
     "matrix_reasoning": "T3_hidden_reasoning",
     "sequence": "T4_numeric_specialized",
-    "open_template": "T5_text_specialized",
+    "open_template": "T1_ultra_compact",
 }
 BEST_TEMPLATE_BY_FAMILY: Dict[str, str] = dict(FAMILY_TEMPLATE_PRIORS)
 FAMILY_TEMPLATE_ROUTER: Dict[str, List[str]] = {
     "bit_transform": ["T4_numeric_specialized", "T1_ultra_compact", "T3_hidden_reasoning"],
-    "cipher_decrypt": ["T5_text_specialized", "T3_hidden_reasoning", "T1_ultra_compact"],
+    "cipher_decrypt": ["T5_text_specialized", "T1_ultra_compact"],
     "fewshot_pattern": ["T3_hidden_reasoning", "T1_ultra_compact", "T4_numeric_specialized"],
     "matrix_reasoning": ["T3_hidden_reasoning", "T4_numeric_specialized", "T1_ultra_compact"],
     "sequence": ["T3_hidden_reasoning", "T1_ultra_compact", "T4_numeric_specialized"],
-    "open_template": ["T5_text_specialized", "T1_ultra_compact", "T3_hidden_reasoning"],
+    "open_template": ["T1_ultra_compact", "T5_text_specialized"],
     "default": ["T1_ultra_compact", "T3_hidden_reasoning", "T4_numeric_specialized"],
 }
 BEST_TEMPLATE_ROUTER_BY_FAMILY: Dict[str, List[str]] = {
@@ -974,12 +978,19 @@ CURRENT_WEAK_FAMILIES: List[str] = []
 def choose_template_id(answer_type: str, prompt_family: str) -> str:
     if prompt_family in BEST_TEMPLATE_BY_FAMILY:
         return BEST_TEMPLATE_BY_FAMILY[prompt_family]
-    if not cfg.enable_prompt_template_ablation:
-        return "T2_compact"
+
     if answer_type in {"numeric", "binary"}:
         return "T4_numeric_specialized"
-    if prompt_family in {"cipher_decrypt", "open_template"} or answer_type == "multi_token_text":
+
+    if prompt_family == "cipher_decrypt":
         return "T5_text_specialized"
+
+    if answer_type in {"short_text", "multi_token_text"}:
+        return "T5_text_specialized"
+
+    if not cfg.enable_prompt_template_ablation:
+        return "T2_compact"
+
     return "T3_hidden_reasoning"
 
 
@@ -994,12 +1005,19 @@ def router_get_templates(prompt_family: str, answer_type: Optional[str] = None, 
         BEST_TEMPLATE_ROUTER_BY_FAMILY.get("default", list(cfg.test_time_template_candidates)),
     )
     candidates = list(base_router)
+
     if answer_type in {"numeric", "binary"}:
         preferred = ["T4_numeric_specialized", "T1_ultra_compact", "T3_hidden_reasoning"]
         candidates = preferred + candidates
-    elif answer_type in {"short_text", "multi_token_text"} or prompt_family in {"cipher_decrypt", "open_template"}:
-        preferred = ["T5_text_specialized", "T1_ultra_compact", "T3_hidden_reasoning"]
+
+    elif prompt_family == "open_template" and answer_type in {"short_text", "multi_token_text"}:
+        preferred = ["T1_ultra_compact", "T5_text_specialized"]
         candidates = preferred + candidates
+
+    elif prompt_family == "cipher_decrypt" or answer_type in {"short_text", "multi_token_text"}:
+        preferred = ["T5_text_specialized", "T1_ultra_compact"]
+        candidates = preferred + candidates
+
     else:
         candidates = ["T1_ultra_compact", "T3_hidden_reasoning"] + candidates
 
@@ -1007,6 +1025,7 @@ def router_get_templates(prompt_family: str, answer_type: Optional[str] = None, 
     for template_id in candidates:
         if template_id in TEMPLATE_POOL and template_id not in deduped:
             deduped.append(template_id)
+
     keep = top_k if top_k is not None else cfg.test_time_router_top_k
     return deduped[: max(1, keep)]
 
@@ -1222,16 +1241,20 @@ def tokenize_answer_only(example: Dict[str, Any]) -> Dict[str, Any]:
 def make_supervision_frame(df: pd.DataFrame, supervision_variant: str) -> pd.DataFrame:
     tmp = df.copy()
     if supervision_variant == "family_aware_mix":
-        short_reasoning_families = {"open_template", "cipher_decrypt", "matrix_reasoning"}
+        # 只让真正偏结构推理、且答案不是 text 的样本继续走 short_reasoning
+        use_short_reasoning = (
+            tmp["prompt_family"].isin({"matrix_reasoning"})
+            & tmp["answer_type"].isin({"numeric", "binary"})
+        )
+
         tmp["supervision_variant"] = np.where(
-            tmp["prompt_family"].isin(short_reasoning_families) | tmp["answer_type"].eq("multi_token_text"),
+            use_short_reasoning,
             "short_reasoning",
             "answer_only",
         )
     else:
         tmp["supervision_variant"] = supervision_variant
     return tmp
-
 
 def build_variant_datasets(records_df: pd.DataFrame, variant: str) -> Dataset:
     ds = Dataset.from_pandas(make_supervision_frame(records_df, variant))
@@ -1869,6 +1892,12 @@ def compute_sample_weights(
         weight *= float(row.difficulty)
         weight *= float(getattr(row, "source_loss_weight", 1.0))
         weight *= 0.8 + 0.2 * float(getattr(row, "pseudo_confidence", 1.0))
+
+        if row.answer_type == "short_text":
+            weight *= cfg.short_text_weight_boost
+            if row.prompt_family == "open_template":
+                weight *= cfg.open_template_short_text_extra_boost
+
         if hard_profile is not None:
             weight *= 1.0 + cfg.hard_mining_family_boost * hard_profile["family"].get(row.prompt_family, 0.0)
             weight *= 1.0 + cfg.hard_mining_template_group_boost * hard_profile["template_group"].get(row.template_group, 0.0)
@@ -3856,6 +3885,14 @@ def rerank_topk_candidates(candidate_df: pd.DataFrame) -> pd.DataFrame:
                 run_multi_seed=True,
             )
 
+            if "answer_type" in serious_pred_df.columns and "hit" in serious_pred_df.columns:
+                short_text_mask = serious_pred_df["answer_type"].eq("short_text")
+                short_text_accuracy = float(
+                    serious_pred_df.loc[short_text_mask, "hit"].mean()
+                ) if short_text_mask.any() else float("nan")
+            else:
+                short_text_accuracy = float("nan")
+
             multi_seed_summary = summarize_multi_seed_result(serious_multi_seed_df)
 
             if cfg.final_rerank_run_submission_style and not rerank_submission_df.empty:
@@ -3873,6 +3910,7 @@ def rerank_topk_candidates(candidate_df: pd.DataFrame) -> pd.DataFrame:
                     "local_accuracy": float(cand.local_accuracy),
                     "candidate_dir": candidate_dir,
                     "serious_accuracy": float(serious_acc),
+                    "short_text_accuracy": float(short_text_accuracy),
                     "multi_seed_mean_accuracy": float(multi_seed_summary["multi_seed_mean_accuracy"]),
                     "multi_seed_accuracy_std": float(multi_seed_summary["multi_seed_accuracy_std"]),
                     "submission_style_accuracy": float(submission_style_acc),
@@ -3889,6 +3927,7 @@ def rerank_topk_candidates(candidate_df: pd.DataFrame) -> pd.DataFrame:
                     "local_accuracy": float(cand.local_accuracy),
                     "candidate_dir": candidate_dir,
                     "serious_accuracy": float("nan"),
+                    "short_text_accuracy": float("nan"),
                     "multi_seed_mean_accuracy": float("nan"),
                     "multi_seed_accuracy_std": float("nan"),
                     "submission_style_accuracy": float("nan"),
@@ -3923,7 +3962,7 @@ def rerank_topk_candidates(candidate_df: pd.DataFrame) -> pd.DataFrame:
             by=[
                 "rerank_status",
                 "serious_accuracy",
-                "submission_style_accuracy",
+                "short_text_accuracy",
                 "multi_seed_mean_accuracy",
                 "multi_seed_accuracy_std",
                 "local_accuracy",
@@ -3937,12 +3976,14 @@ def rerank_topk_candidates(candidate_df: pd.DataFrame) -> pd.DataFrame:
             by=[
                 "rerank_status",
                 "serious_accuracy",
+                "short_text_accuracy",
+                "submission_style_accuracy",
                 "multi_seed_mean_accuracy",
                 "multi_seed_accuracy_std",
                 "local_accuracy",
                 "step",
             ],
-            ascending=[True, False, False, True, False, False],
+            ascending=[True, False, False, False, False, True, False, False],
             na_position="last",
         ).reset_index(drop=True)
 
