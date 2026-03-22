@@ -3267,18 +3267,49 @@ print("current primary supervision variant:", cfg.primary_supervision_variant)
 print("initial family template priors:")
 display(pd.DataFrame(sorted(BEST_TEMPLATE_BY_FAMILY.items()), columns=["prompt_family", "template_id"]))
 
-if cfg.run_supervision_ablation:
+def can_run_supervision_ablation() -> Tuple[bool, str]:
+    if not cfg.run_supervision_ablation:
+        return False, "disabled by cfg"
+
+    if not torch.cuda.is_available():
+        return False, "CUDA unavailable"
+
+    # 当前环境没有 bitsandbytes 时，ablation 会尝试再加载一个非量化 30B 模型，
+    # 很容易走到 auto offload / meta tensors，导致 load_training_model() 报错。
+    if not package_available("bitsandbytes"):
+        return False, "bitsandbytes unavailable; supervision ablation would require a second full-size non-quantized 30B model"
+
+    try:
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        free_gib = free_bytes / 1024**3
+        total_gib = total_bytes / 1024**3
+    except Exception:
+        return False, "unable to query CUDA free memory"
+
+    # supervision ablation 会额外再起一个训练模型；留一个保守门槛，避免 meta/offload
+    if free_gib < 55:
+        return False, f"insufficient free CUDA memory for a second model ({free_gib:.2f} / {total_gib:.2f} GiB free)"
+
+    return True, "ok"
+
+
+ablation_ok, ablation_reason = can_run_supervision_ablation()
+
+if ablation_ok:
     ablation_overall = []
     for variant in cfg.supervision_ablation_variants:
         overall_df, grouped = run_supervision_variant_experiment(variant)
         ablation_overall.append(overall_df)
         for key, value in grouped.items():
             value.to_csv(Path(cfg.work_dir) / f"supervision_{variant}_{key}.csv", index=False)
-    ablation_overall_df = pd.concat(ablation_overall, ignore_index=True).sort_values(["value", "boxed_parse_rate"], ascending=False)
+
+    ablation_overall_df = pd.concat(ablation_overall, ignore_index=True).sort_values(
+        ["value", "boxed_parse_rate"], ascending=False
+    )
     display(ablation_overall_df)
     ablation_overall_df.to_csv(Path(cfg.work_dir) / "supervision_ablation_overall.csv", index=False)
 else:
-    print("skip full supervision ablation: set cfg.run_supervision_ablation=True to compare answer_only / short_reasoning / family_aware_mix side-by-side.")
+    print(f"skip full supervision ablation: {ablation_reason}")
 
 template_preview_df = build_seeded_family_balanced_subset(valid_fold, cfg.reasoning_template_eval_rows, seed=cfg.seed)
 print("template preview rows (reasoning_template_eval_rows):", template_preview_df.shape)
