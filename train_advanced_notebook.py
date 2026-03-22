@@ -140,8 +140,8 @@ class CFG:
 
     # ===== curriculum =====
     stage1_epochs: float = 0.6
-    stage2_epochs: float = 1.2
-    stage2_rounds: int = 3
+    stage2_epochs: float = 1.4
+    stage2_rounds: int = 4
     stage1_max_prompt_chars: int = 900
     stage1_lr: float = 1.6e-4
     stage2_lr: float = 9e-5
@@ -172,9 +172,9 @@ class CFG:
     fallback_template_id: str = "T2_compact"
     pseudolabel_min_confidence: float = 0.85
     pseudolabel_source_loss_weight: float = 0.4
-    hard_mining_bottom_family_k: int = 3
-    hard_mining_bottom_answer_type_k: int = 2
-    hard_mining_bottom_bucket_k: int = 2
+    hard_mining_bottom_family_k: int = 5
+    hard_mining_bottom_answer_type_k: int = 3
+    hard_mining_bottom_bucket_k: int = 3
     template_ablation_after_stage1_rows: int = 128
     template_ablation_stage2_min_gain: float = 0.02
     template_ablation_family_min_rows: int = 10
@@ -190,11 +190,11 @@ class CFG:
     stage2_refresh_replay_family_error_threshold: float = 0.40
     fixed_sanity_rows: int = 64
     stage1_family_frequency_quantile: float = 0.55
-    hard_mining_family_boost: float = 0.35
-    hard_mining_template_group_boost: float = 0.20
-    hard_mining_answer_type_boost: float = 0.20
-    hard_mining_bucket_boost: float = 0.15
-    hard_mining_sample_boost: float = 0.60
+    hard_mining_family_boost: float = 0.50
+    hard_mining_template_group_boost: float = 0.28
+    hard_mining_answer_type_boost: float = 0.25
+    hard_mining_bucket_boost: float = 0.20
+    hard_mining_sample_boost: float = 0.80
     replay_probe_rows: int = 128
     short_text_weight_boost: float = 1.25
     open_template_short_text_extra_boost: float = 1.10
@@ -558,11 +558,74 @@ display(full_train_df["example_len_bucket"].value_counts(dropna=False).sort_inde
 # %%
 full_train_df = full_train_df.drop_duplicates(subset=["prompt_norm", "answer_norm"]).reset_index(drop=True)
 
-splitter = GroupShuffleSplit(n_splits=1, test_size=cfg.valid_size, random_state=cfg.seed)
-train_idx, valid_idx = next(splitter.split(full_train_df, groups=full_train_df["template_group"]))
+def family_aware_group_split(
+    df: pd.DataFrame,
+    valid_size: float,
+    seed: int,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    train_parts = []
+    valid_parts = []
 
-train_fold = full_train_df.iloc[train_idx].reset_index(drop=True)
-valid_fold = full_train_df.iloc[valid_idx].reset_index(drop=True)
+    for family, block in df.groupby("prompt_family", sort=True):
+        block = block.reset_index(drop=True)
+        group_count = block["template_group"].nunique()
+
+        # 至少给这个 family 留一个有效 holdout
+        target_valid_rows = max(1, int(round(len(block) * valid_size)))
+
+        if len(block) <= 2 or group_count < 2:
+            # 极小 family 的兜底
+            if len(block) == 1:
+                train_part = block.copy()
+                valid_part = block.iloc[:0].copy()
+            else:
+                valid_part = block.sample(n=1, random_state=seed)
+                train_part = block.drop(valid_part.index)
+        else:
+            # 先按 template_group 做 group split，避免模板泄漏
+            group_test_size = min(max(valid_size, 1.0 / group_count), 0.5)
+            splitter = GroupShuffleSplit(
+                n_splits=1,
+                test_size=group_test_size,
+                random_state=seed,
+            )
+            tr_idx, va_idx = next(splitter.split(block, groups=block["template_group"]))
+            train_part = block.iloc[tr_idx].copy()
+            valid_part = block.iloc[va_idx].copy()
+
+            # 如果这个 family 在 valid 里太少，再从 train 中补一点不同 group
+            if len(valid_part) < target_valid_rows:
+                remain = train_part.loc[
+                    ~train_part["template_group"].isin(valid_part["template_group"])
+                ].copy()
+
+                if not remain.empty:
+                    extra_need = min(target_valid_rows - len(valid_part), len(remain))
+                    extra = remain.sample(n=extra_need, random_state=seed)
+                    valid_part = pd.concat([valid_part, extra], ignore_index=True)
+                    train_part = train_part.drop(extra.index)
+
+        train_parts.append(train_part)
+        valid_parts.append(valid_part)
+
+    train_out = (
+        pd.concat(train_parts, ignore_index=True)
+        .sample(frac=1.0, random_state=seed)
+        .reset_index(drop=True)
+    )
+    valid_out = (
+        pd.concat(valid_parts, ignore_index=True)
+        .sample(frac=1.0, random_state=seed)
+        .reset_index(drop=True)
+    )
+    return train_out, valid_out
+
+
+train_fold, valid_fold = family_aware_group_split(
+    full_train_df,
+    valid_size=cfg.valid_size,
+    seed=cfg.seed,
+)
 
 
 def shrink_df_for_smoke(df: pd.DataFrame, max_rows: int) -> pd.DataFrame:
@@ -2145,6 +2208,7 @@ def evaluate_accuracy(
     template_override: Optional[str] = None,
     max_new_tokens_grid: Sequence[int] = (64, 96),
     extractor_fn=metric_extract_prediction,
+    router_top_k: Optional[int] = None,
 ) -> Tuple[float, pd.DataFrame]:
     rows = []
     for row in df.itertuples(index=False):
@@ -2153,7 +2217,7 @@ def evaluate_accuracy(
         routed_templates = [template_override] if template_override is not None else router_get_templates(
             prompt_family,
             answer_type=answer_type,
-            top_k=1,
+            top_k=router_top_k,
         )
         result = predict_one_row(
             model,
@@ -2779,13 +2843,17 @@ class LocalAccuracyCallback(TrainerCallback):
         self,
         eval_df: pd.DataFrame,
         save_path: str,
-        extractor_fn=fast_extract_prediction,
+        extractor_fn=metric_extract_prediction,
         save_top_k: int = 1,
         candidates_dir: Optional[str] = None,
         tokenizer=None,
         metric_name: str = "local_accuracy",
         min_global_step: int = 0,
+        router_top_k: Optional[int] = None,
+        max_new_tokens_grid: Sequence[int] = (64, 96),
     ):
+        self.router_top_k = router_top_k
+        self.max_new_tokens_grid = tuple(max_new_tokens_grid)
         self.eval_df = eval_df
         self.save_path = save_path
         self.extractor_fn = extractor_fn
@@ -2875,7 +2943,13 @@ class LocalAccuracyCallback(TrainerCallback):
         )
 
     def on_evaluate(self, args, state, control, model=None, **kwargs):
-        acc, pred_df = evaluate_accuracy(model, self.eval_df, extractor_fn=self.extractor_fn)
+        acc, pred_df = evaluate_accuracy(
+            model,
+            self.eval_df,
+            extractor_fn=self.extractor_fn,
+            router_top_k=self.router_top_k,
+            max_new_tokens_grid=self.max_new_tokens_grid,
+        )
         record = {"step": int(state.global_step), "local_accuracy": float(acc)}
         self.history.append(record)
 
@@ -3355,16 +3429,20 @@ if not cfg.smoke_test_mode:
 # ## Cell 19 — Stage 1 训练（短 / 规则明显 family 先收敛）
 
 # %%
+leaderboard_proxy_df = serious_eval_df.copy()
+
 local_callback = LocalAccuracyCallback(
-    eval_df=fast_eval_df,
+    eval_df=leaderboard_proxy_df,
     save_path=str(Path(cfg.work_dir) / "local_accuracy_history.csv"),
+    extractor_fn=metric_extract_prediction,
     save_top_k=cfg.topk_candidate_keep,
     candidates_dir=None if cfg.smoke_test_mode else cfg.topk_candidate_dir,
     tokenizer=None if cfg.smoke_test_mode else tokenizer,
     metric_name="local_accuracy",
     min_global_step=cfg.topk_min_global_step,
+    router_top_k=cfg.test_time_router_top_k,
+    max_new_tokens_grid=(64, 96),
 )
-
 if len(stage1_ds) > 0:
     trainer_stage1 = WeightedTrainer(
         model=model,
@@ -4027,6 +4105,91 @@ def rerank_topk_candidates(candidate_df: pd.DataFrame) -> pd.DataFrame:
 # 这里显式校验 `adapter_config.json`，避免训练完才发现不能交。
 
 # %%
+def release_training_objects_before_final_rerank() -> None:
+    global model, trainer_stage1, trainer_stage2, collator
+
+    # 断开 collator 对旧模型的引用
+    if "collator" in globals() and collator is not None:
+        try:
+            if hasattr(collator, "model"):
+                collator.model = None
+        except Exception:
+            pass
+        try:
+            del collator
+        except Exception:
+            pass
+
+    # 清 trainer
+    for trainer_name in ("trainer_stage1", "trainer_stage2"):
+        if trainer_name in globals():
+            try:
+                trainer_obj = globals()[trainer_name]
+                try:
+                    if hasattr(trainer_obj, "model"):
+                        trainer_obj.model = None
+                except Exception:
+                    pass
+                try:
+                    if hasattr(trainer_obj, "model_wrapped"):
+                        trainer_obj.model_wrapped = None
+                except Exception:
+                    pass
+                try:
+                    if hasattr(trainer_obj, "optimizer"):
+                        trainer_obj.optimizer = None
+                except Exception:
+                    pass
+                try:
+                    if hasattr(trainer_obj, "lr_scheduler"):
+                        trainer_obj.lr_scheduler = None
+                except Exception:
+                    pass
+                del globals()[trainer_name]
+            except Exception:
+                pass
+
+    # 清主模型
+    if "model" in globals():
+        try:
+            old_model = model
+            del model
+            del old_model
+        except Exception:
+            pass
+
+    gc.collect()
+
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+
+def release_before_final_proxy_eval() -> None:
+    gc.collect()
+
+    try:
+        _cleanup_after_candidate_eval()
+    except Exception:
+        pass
+
+    gc.collect()
+
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+
 final_adapter_dir = Path(cfg.adapter_dir)
 if final_adapter_dir.exists():
     shutil.rmtree(final_adapter_dir, ignore_errors=True)
@@ -4036,10 +4199,13 @@ if cfg.smoke_test_mode:
     final_adapter_dir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(final_adapter_dir)
     tokenizer.save_pretrained(final_adapter_dir)
+
 else:
     topk_candidate_df = load_topk_candidate_manifest()
 
     if not topk_candidate_df.empty:
+        release_training_objects_before_final_rerank()
+
         rerank_report_df = rerank_topk_candidates(topk_candidate_df)
         rerank_report_df.to_csv(Path(cfg.final_rerank_report_path), index=False)
 
@@ -4070,7 +4236,58 @@ with open(adapter_cfg_path, "r", encoding="utf-8") as f:
 assert int(adapter_cfg.get("r", cfg.lora_r)) <= cfg.max_lora_rank, "导出的 LoRA rank 超过比赛限制"
 print(json.dumps(adapter_cfg, ensure_ascii=False, indent=2)[:1200])
 print("adapter files:", sorted(p.name for p in final_adapter_dir.iterdir()))
+# ===== 最终导出 adapter 的 proxy eval =====
+if cfg.smoke_test_mode:
+    print("[smoke] skip final exported adapter proxy eval in Cell 23")
+else:
+    release_before_final_proxy_eval()
 
+    reloaded_final_model = None
+    try:
+        reloaded_final_model = load_candidate_adapter_for_eval(str(final_adapter_dir))
+
+        final_export_proxy_acc, final_export_proxy_df = evaluate_accuracy(
+            reloaded_final_model,
+            serious_eval_df,
+            extractor_fn=metric_extract_prediction,
+            router_top_k=cfg.test_time_router_top_k,
+            max_new_tokens_grid=(64, 96),
+        )
+
+        print(f"[final exported adapter proxy accuracy] {final_export_proxy_acc:.4f}")
+        final_export_proxy_df.to_csv(
+            Path(cfg.work_dir) / "final_exported_adapter_proxy_eval.csv",
+            index=False,
+        )
+
+    except RuntimeError as e:
+        err_text = str(e)
+        if "Unable to reload base model for candidate evaluation" in err_text or "CUDA out of memory" in err_text:
+            print("[final proxy eval] skipped due to reload/OOM after rerank")
+            print(err_text)
+        else:
+            raise
+
+    finally:
+        if reloaded_final_model is not None:
+            try:
+                del reloaded_final_model
+            except Exception:
+                pass
+        try:
+            _cleanup_after_candidate_eval()
+        except Exception:
+            pass
+        gc.collect()
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
 # %% [markdown]
 # ## Cell 24 — 打包 submission.zip
 
