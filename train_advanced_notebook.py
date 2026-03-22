@@ -206,6 +206,22 @@ class CFG:
     save_final_snapshot_before_post_eval: bool = True
     post_eval_fail_open: bool = True
 
+    # ===== smoke test mode =====
+    smoke_test_mode: bool = True
+    smoke_train_rows: int = 24
+    smoke_valid_rows: int = 12
+    smoke_fast_eval_rows: int = 8
+    smoke_serious_eval_rows: int = 12
+    smoke_run_forward_check: bool = True
+    smoke_run_generate_check: bool = True
+    smoke_disable_rerank: bool = True
+
+    smoke_profile: str = "pipeline"   # "fast" | "pipeline"
+    smoke_train_max_steps_stage1: int = 1
+    smoke_train_max_steps_stage2: int = 1
+    smoke_run_export_reload_check: bool = True
+    smoke_export_reload_rows: int = 2
+
     target_modules_final: Tuple[str, ...] = (
         "q_proj",
         "k_proj",
@@ -223,6 +239,54 @@ class CFG:
 
 cfg = CFG()
 cfg.force_nemotron_torch_fallback = True
+
+if cfg.smoke_test_mode:
+    print(f"SMOKE TEST MODE ENABLED: profile={cfg.smoke_profile}")
+
+    # 这些重功能在 smoke 中继续关闭
+    cfg.run_stage1_multi_seed_eval = False
+    cfg.run_stage1_submission_style_eval = False
+    cfg.run_post_train_heavy_eval = False
+    cfg.run_supervision_ablation = False
+    cfg.enable_consensus_pseudolabel_refresh = False
+    cfg.enable_prompt_template_ablation = False
+
+    cfg.save_stage1_snapshot = False
+    cfg.save_final_snapshot_before_post_eval = False
+
+    cfg.fast_eval_examples = min(cfg.fast_eval_examples, cfg.smoke_fast_eval_rows)
+    cfg.serious_eval_examples = min(cfg.serious_eval_examples, cfg.smoke_serious_eval_rows)
+
+    if cfg.smoke_disable_rerank:
+        cfg.topk_candidate_keep = 0
+        cfg.final_rerank_run_submission_style = False
+
+    if cfg.smoke_profile == "fast":
+        # 旧的极快 smoke：不测 trainer 主链
+        cfg.stage1_epochs = 0.0
+        cfg.stage2_epochs = 0.0
+        cfg.stage2_rounds = 1
+
+    elif cfg.smoke_profile == "pipeline":
+        # 新的轻量全链路 smoke：只跑极少步数，但把主链走通
+        cfg.stage1_epochs = 1.0
+        cfg.stage2_epochs = 1.0
+        cfg.stage2_rounds = 1
+
+        cfg.grad_accum = 1
+        cfg.logging_steps = 1
+        cfg.save_steps = 1
+        cfg.eval_steps = 1
+        cfg.warmup_steps_override = 0
+
+        # 再缩小一点数据量，让 smoke 更轻
+        cfg.smoke_train_rows = min(cfg.smoke_train_rows, 16)
+        cfg.smoke_valid_rows = min(cfg.smoke_valid_rows, 8)
+        cfg.smoke_fast_eval_rows = min(cfg.smoke_fast_eval_rows, 4)
+        cfg.smoke_serious_eval_rows = min(cfg.smoke_serious_eval_rows, 6)
+
+    else:
+        raise ValueError(f"Unknown smoke_profile: {cfg.smoke_profile}")
 
 Path(cfg.work_dir).mkdir(parents=True, exist_ok=True)
 Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
@@ -253,6 +317,8 @@ print("CUDA device count:", torch.cuda.device_count())
 if torch.cuda.is_available():
     for idx in range(torch.cuda.device_count()):
         print(f"GPU {idx}: {torch.cuda.get_device_name(idx)}")
+
+
 
 # %% [markdown]
 # ## Cell 4 — 读取比赛数据 + 可选外挂数据
@@ -481,6 +547,7 @@ display(full_train_df["answer_type"].value_counts().to_frame("count"))
 print("length bucket")
 display(full_train_df["example_len_bucket"].value_counts(dropna=False).sort_index().to_frame("count"))
 
+
 # %% [markdown]
 # ## Cell 6 — 去重 + group split
 # 
@@ -495,12 +562,43 @@ train_idx, valid_idx = next(splitter.split(full_train_df, groups=full_train_df["
 train_fold = full_train_df.iloc[train_idx].reset_index(drop=True)
 valid_fold = full_train_df.iloc[valid_idx].reset_index(drop=True)
 
+
+def shrink_df_for_smoke(df: pd.DataFrame, max_rows: int) -> pd.DataFrame:
+    if len(df) <= max_rows:
+        return df.reset_index(drop=True)
+
+    sampled = []
+    groups = max(df["prompt_family"].nunique(), 1)
+    per_family = max(1, max_rows // groups)
+
+    for _, block in df.groupby("prompt_family", sort=True):
+        sampled.append(block.head(per_family))
+
+    out = pd.concat(sampled, ignore_index=True)
+
+    if len(out) < max_rows:
+        if "id" in df.columns and "id" in out.columns:
+            used_ids = set(out["id"].tolist())
+            remain = df.loc[~df["id"].isin(used_ids)].head(max_rows - len(out))
+        else:
+            remain = df.head(max_rows - len(out))
+        out = pd.concat([out, remain], ignore_index=True)
+
+    return out.head(max_rows).reset_index(drop=True)
+
+
+if cfg.smoke_test_mode:
+    train_fold = shrink_df_for_smoke(train_fold, cfg.smoke_train_rows)
+    valid_fold = shrink_df_for_smoke(valid_fold, cfg.smoke_valid_rows)
+    print("[smoke] shrunk train_fold:", train_fold.shape)
+    print("[smoke] shrunk valid_fold:", valid_fold.shape)
+
 print("train fold:", train_fold.shape)
 print("valid fold:", valid_fold.shape)
-print("train families:", train_fold['prompt_family'].nunique())
-print("valid families:", valid_fold['prompt_family'].nunique())
-print("train template groups:", train_fold['template_group'].nunique())
-print("valid template groups:", valid_fold['template_group'].nunique())
+print("train families:", train_fold["prompt_family"].nunique())
+print("valid families:", valid_fold["prompt_family"].nunique())
+print("train template groups:", train_fold["template_group"].nunique())
+print("valid template groups:", valid_fold["template_group"].nunique())
 
 # %% [markdown]
 # ## Cell 7 — 竞赛近似 metric
@@ -749,6 +847,7 @@ def approx_equal(pred: str, gold: str, rel_tol: float = cfg.numeric_rel_tol) -> 
     return False
 
 
+
 # %% [markdown]
 # ## Cell 8 — Prompt 模板工程
 # 
@@ -939,6 +1038,7 @@ def build_short_reasoning_scaffold(answer: Any, answer_type: str, prompt_family:
 
     return f"{family_hint}\n{step_hint}\nFinal answer: {final_boxed}"
 
+
 # %% [markdown]
 # ## Cell 9 — 构造训练样本（answer-only loss）
 # 
@@ -1031,6 +1131,7 @@ stage1_records, stage2_records, stable_families = split_stage_records(train_reco
 print(train_records.shape, valid_records.shape)
 display(train_records.head(2))
 
+
 # %% [markdown]
 # ## Cell 10 — Stage 1 / Stage 2 curriculum 切分
 # 
@@ -1075,6 +1176,7 @@ if tokenizer.pad_token is None:
 tokenizer.padding_side = "right"
 print("pad token:", tokenizer.pad_token)
 print("eos token:", tokenizer.eos_token)
+
 
 # %% [markdown]
 # ## Cell 12 — Tokenize（只对答案部分算 loss）
@@ -1217,6 +1319,7 @@ valid_ds = valid_variant_ds[cfg.primary_supervision_variant]
 
 print(stage2_ds[0].keys())
 print("non-masked labels:", sum(x != -100 for x in stage2_ds[0]["labels"]))
+
 
 
 
@@ -1367,8 +1470,6 @@ import os
 import importlib
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
-# 这里直接兜底打开补丁开关，防止你前面忘了设
-cfg.force_nemotron_torch_fallback = True
 
 # 加载时保守一点，避免 max_memory 估计过激进
 cfg.cuda_load_headroom_gib = max(12, int(getattr(cfg, "cuda_load_headroom_gib", 12)))
@@ -1472,19 +1573,27 @@ def build_model_load_kwargs(
     attn_implementation: Optional[str],
 ) -> Dict[str, Any]:
     load_kwargs: Dict[str, Any] = {
-        "dtype": torch.bfloat16 if cfg.use_bf16 else torch.float16,
+        "torch_dtype": torch.bfloat16 if cfg.use_bf16 else torch.float16,
         "trust_remote_code": False,
         "local_files_only": True,
-        "low_cpu_mem_usage": True,
     }
 
     if torch.cuda.is_available():
-        load_kwargs["device_map"] = "auto"
-        max_memory = build_model_max_memory()
-        if max_memory is not None:
-            load_kwargs["max_memory"] = max_memory
+        if quant_config is not None:
+            # 训练主模型时，避免 auto device_map + accelerate/offload 把部分参数留在 meta
+            # 单卡量化加载更稳，和后面 candidate reload 的思路保持一致
+            load_kwargs["device_map"] = {"": 0}
+            load_kwargs["low_cpu_mem_usage"] = False
+        else:
+            # 非量化 fallback 只作为兜底；保留 auto，尽量让它还能尝试加载
+            load_kwargs["device_map"] = "auto"
+            load_kwargs["low_cpu_mem_usage"] = True
+            max_memory = build_model_max_memory()
+            if max_memory is not None:
+                load_kwargs["max_memory"] = max_memory
     else:
         load_kwargs["device_map"] = "cpu"
+        load_kwargs["low_cpu_mem_usage"] = True
 
     if quant_config is not None:
         load_kwargs["quantization_config"] = quant_config
@@ -1493,6 +1602,28 @@ def build_model_load_kwargs(
         load_kwargs["attn_implementation"] = attn_implementation
 
     return load_kwargs
+
+def find_meta_tensors(model: torch.nn.Module, max_show: int = 20) -> List[str]:
+    bad = []
+
+    for name, param in model.named_parameters():
+        try:
+            if param.device.type == "meta":
+                bad.append(f"param::{name}")
+        except Exception:
+            pass
+
+    for name, buf in model.named_buffers():
+        try:
+            if buf.device.type == "meta":
+                bad.append(f"buffer::{name}")
+        except Exception:
+            pass
+
+    if len(bad) > max_show:
+        bad = bad[:max_show] + [f"... ({len(bad)} total meta tensors)"]
+
+    return bad
 
 
 def load_training_model() -> Tuple[torch.nn.Module, List[str]]:
@@ -1628,12 +1759,86 @@ def load_training_model() -> Tuple[torch.nn.Module, List[str]]:
     # 3) PEFT 包装后再补一次，防止真正训练对象回到 fast CUDA path
     force_nemotron_torch_fallback(model, tag="after_peft")
 
+    meta_tensors = find_meta_tensors(model)
+    if meta_tensors:
+        raise RuntimeError(
+            "Model still contains meta tensors after load/PEFT patch. "
+            "This usually means auto device_map/offload left some parameters unmaterialized.\n"
+            f"Examples:\n" + "\n".join(meta_tensors)
+        )
+
     return model, lora_targets
 
+def get_model_input_device(model: torch.nn.Module) -> torch.device:
+    # 优先找第一个非 meta 参数的设备
+    for p in model.parameters():
+        try:
+            if p.device.type != "meta":
+                return p.device
+        except Exception:
+            pass
+
+    # 再看 hf_device_map
+    hf_device_map = getattr(model, "hf_device_map", None)
+    if isinstance(hf_device_map, dict):
+        for v in hf_device_map.values():
+            if isinstance(v, int):
+                return torch.device(f"cuda:{v}")
+            if isinstance(v, str) and v.startswith("cuda"):
+                return torch.device(v)
+
+    return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
+def run_smoke_model_sanity_checks(model, tokenizer, sanity_df: pd.DataFrame) -> None:
+    if sanity_df is None or sanity_df.empty:
+        print("[smoke] sanity_df is empty, skip.")
+        return
+
+    meta_tensors = find_meta_tensors(model)
+    if meta_tensors:
+        raise RuntimeError(
+            "Smoke sanity aborted because model still has meta tensors.\n"
+            + "\n".join(meta_tensors)
+        )
+
+    row = sanity_df.iloc[0]
+    prompt_text = template_compact(row["prompt"])
+
+    toks = tokenizer(
+        prompt_text,
+        return_tensors="pt",
+        truncation=True,
+        max_length=min(cfg.max_seq_len, 512),
+    )
+
+    device = get_model_input_device(model)
+    toks = {k: v.to(device) for k, v in toks.items()}
+
+    if cfg.smoke_run_forward_check:
+        with torch.no_grad():
+            out = model(**toks)
+        print("[smoke] forward ok; logits shape:", tuple(out.logits.shape))
+
+    if cfg.smoke_run_generate_check:
+        with torch.no_grad():
+            gen = model.generate(
+                **toks,
+                max_new_tokens=16,
+                do_sample=False,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+        preview = tokenizer.decode(gen[0], skip_special_tokens=True)
+        print("[smoke] generate ok; preview:")
+        print(preview[:400])
 
 model, lora_targets = load_training_model()
 print("LoRA targets:", lora_targets)
 model.print_trainable_parameters()
+
+if cfg.smoke_test_mode:
+    print("[smoke] running model sanity checks...")
+    run_smoke_model_sanity_checks(model, tokenizer, valid_fold.head(1))
 
 # %% [markdown]
 # ## Cell 14 — 自定义 sampler：family reweight + length bonus + difficulty curriculum
@@ -1711,6 +1916,7 @@ class WeightedTrainer(Trainer):
             pin_memory=torch.cuda.is_available(),
         )
 
+
 # %% [markdown]
 # ## Cell 16 — 本地生成评估 callback
 # 
@@ -1761,14 +1967,20 @@ def build_seeded_family_balanced_subset(df: pd.DataFrame, max_rows: int, seed: i
     return out
 
 
-fast_eval_df = stratified_valid_subset(valid_fold, cfg.fast_eval_examples)
-serious_eval_df = build_seeded_family_balanced_subset(valid_fold, cfg.serious_eval_examples, seed=cfg.seed)
+fast_eval_rows = cfg.smoke_fast_eval_rows if cfg.smoke_test_mode else cfg.fast_eval_examples
+serious_eval_rows = cfg.smoke_serious_eval_rows if cfg.smoke_test_mode else cfg.serious_eval_examples
+fixed_sanity_rows = min(cfg.fixed_sanity_rows, 8) if cfg.smoke_test_mode else cfg.fixed_sanity_rows
+replay_probe_rows = min(cfg.replay_probe_rows, 8) if cfg.smoke_test_mode else cfg.replay_probe_rows
+
+fast_eval_df = stratified_valid_subset(valid_fold, fast_eval_rows)
+serious_eval_df = build_seeded_family_balanced_subset(valid_fold, serious_eval_rows, seed=cfg.seed)
 serious_eval_views = {
-    seed: build_seeded_family_balanced_subset(valid_fold, cfg.serious_eval_examples, seed=seed)
+    seed: build_seeded_family_balanced_subset(valid_fold, serious_eval_rows, seed=seed)
     for seed in cfg.serious_eval_seeds
 }
-fixed_sanity_df = build_fixed_sanity_subset(valid_fold, cfg.fixed_sanity_rows)
-train_replay_probe_df = build_fixed_sanity_subset(train_fold, cfg.replay_probe_rows)
+fixed_sanity_df = build_fixed_sanity_subset(valid_fold, fixed_sanity_rows)
+train_replay_probe_df = build_fixed_sanity_subset(train_fold, replay_probe_rows)
+
 print("fast eval subset:", fast_eval_df.shape)
 print("serious eval subset:", serious_eval_df.shape)
 print("serious eval view seeds:", {seed: df.shape for seed, df in serious_eval_views.items()})
@@ -2550,7 +2762,7 @@ class LocalAccuracyCallback(TrainerCallback):
         self.extractor_fn = extractor_fn
         self.history: List[Dict[str, Any]] = []
 
-        self.save_top_k = max(int(save_top_k), 1)
+        self.save_top_k = max(int(save_top_k), 0)
         self.candidates_dir = Path(candidates_dir) if candidates_dir is not None else None
         self.tokenizer = tokenizer
         self.metric_name = metric_name
@@ -2585,6 +2797,8 @@ class LocalAccuracyCallback(TrainerCallback):
                 shutil.rmtree(path, ignore_errors=True)
 
     def _should_save_candidate(self, step: int, score: float) -> bool:
+        if self.save_top_k <= 0:
+            return False
         if step < self.min_global_step:
             return False
         if len(self.topk_candidates) < self.save_top_k:
@@ -2655,6 +2869,7 @@ class LocalAccuracyCallback(TrainerCallback):
 
         return control
 
+
 # %% [markdown]
 # ## Cell 17 — Data collator + 训练参数工厂
 
@@ -2670,7 +2885,16 @@ collator = DataCollatorForSeq2Seq(
 
 
 def build_training_args(stage_name: str, lr: float, epochs: float) -> TrainingArguments:
-    return TrainingArguments(
+    is_smoke_pipeline = cfg.smoke_test_mode and cfg.smoke_profile == "pipeline"
+
+    max_steps = None
+    if is_smoke_pipeline:
+        if stage_name == "stage1":
+            max_steps = cfg.smoke_train_max_steps_stage1
+        elif stage_name.startswith("stage2"):
+            max_steps = cfg.smoke_train_max_steps_stage2
+
+    kwargs = dict(
         output_dir=str(Path(cfg.output_dir) / stage_name),
         num_train_epochs=epochs,
         learning_rate=lr,
@@ -2695,6 +2919,11 @@ def build_training_args(stage_name: str, lr: float, epochs: float) -> TrainingAr
         save_total_limit=2,
         load_best_model_at_end=False,
     )
+
+    if max_steps is not None and int(max_steps) > 0:
+        kwargs["max_steps"] = int(max_steps)
+
+    return TrainingArguments(**kwargs)
 
 def maybe_extend_stage2_with_pseudolabels(
     model: torch.nn.Module,
@@ -2985,6 +3214,7 @@ def run_supervision_variant_experiment(variant: str) -> Tuple[pd.DataFrame, Dict
     grouped = summarize_eval_metrics(variant_pred_df)
     return overall_df, grouped
 
+
 # %% [markdown]
 # ## Cell 18 — A/B 监督形式预检 + 训练前模板先验
 # 
@@ -3044,6 +3274,23 @@ def save_adapter_snapshot(model: torch.nn.Module, tokenizer, save_dir: str, tag:
     print(f"[snapshot saved] {save_path}" + (f" ({tag})" if tag else ""))
 
 
+
+# Cell 18.9
+if not cfg.smoke_test_mode:
+    topk_dir = Path(cfg.topk_candidate_dir)
+    manifest_path = Path(cfg.topk_candidate_manifest_path)
+    rerank_path = Path(cfg.final_rerank_report_path)
+    export_info_path = Path(cfg.final_export_info_path)
+
+    if topk_dir.exists():
+        shutil.rmtree(topk_dir, ignore_errors=True)
+    topk_dir.mkdir(parents=True, exist_ok=True)
+
+    for p in [manifest_path, rerank_path, export_info_path]:
+        if p.exists():
+            p.unlink()
+
+
 # %% [markdown]
 # ## Cell 19 — Stage 1 训练（短 / 规则明显 family 先收敛）
 
@@ -3052,8 +3299,8 @@ local_callback = LocalAccuracyCallback(
     eval_df=fast_eval_df,
     save_path=str(Path(cfg.work_dir) / "local_accuracy_history.csv"),
     save_top_k=cfg.topk_candidate_keep,
-    candidates_dir=cfg.topk_candidate_dir,
-    tokenizer=tokenizer,
+    candidates_dir=None if cfg.smoke_test_mode else cfg.topk_candidate_dir,
+    tokenizer=None if cfg.smoke_test_mode else tokenizer,
     metric_name="local_accuracy",
     min_global_step=cfg.topk_min_global_step,
 )
@@ -3068,19 +3315,49 @@ if len(stage1_ds) > 0:
         sample_weights=stage1_weights,
         callbacks=[local_callback],
     )
-    trainer_stage1.train()
 
-    if cfg.save_stage1_snapshot:
-        save_adapter_snapshot(
+    if cfg.smoke_test_mode and cfg.smoke_profile == "fast":
+        print("[smoke-fast] skip stage1 trainer lifecycle; run direct eval only")
+        smoke_stage1_acc, smoke_stage1_pred_df = evaluate_accuracy(
             model,
-            tokenizer,
-            str(Path(cfg.snapshot_root_dir) / "after_stage1_train"),
-            tag="after_stage1_train",
+            fast_eval_df,
+            extractor_fn=fast_extract_prediction,
         )
-        cleanup_cuda()
+        print(f"[smoke-fast] stage1 direct local accuracy: {smoke_stage1_acc:.4f}")
+        smoke_stage1_pred_df.to_csv(
+            Path(cfg.work_dir) / "smoke_fast_stage1_direct_eval.csv",
+            index=False,
+        )
+
+    else:
+        print("[smoke] run stage1 trainer lifecycle" if cfg.smoke_test_mode else "run stage1 training")
+        trainer_stage1.train()
+
+        if cfg.smoke_test_mode:
+            print("[smoke] skip trainer_stage1.evaluate() after train; eval already ran during train()")
+
+            # 如果你还想做一次“训练后手动检查”，不要再走 trainer.evaluate()
+            smoke_stage1_acc, smoke_stage1_pred_df = evaluate_accuracy(
+                model,
+                fast_eval_df,
+                extractor_fn=fast_extract_prediction,
+            )
+            print(f"[smoke] post-train direct local accuracy: {smoke_stage1_acc:.4f}")
+            smoke_stage1_pred_df.to_csv(
+                Path(cfg.work_dir) / "smoke_stage1_post_train_eval.csv",
+                index=False,
+            )
+
+        if cfg.save_stage1_snapshot:
+            save_adapter_snapshot(
+                model,
+                tokenizer,
+                str(Path(cfg.snapshot_root_dir) / "after_stage1_train"),
+                tag="after_stage1_train",
+            )
+            cleanup_cuda()
 else:
     print("skip stage1: no samples after curriculum filter")
-
 # %% [markdown]
 # ## Cell 20 — Stage 1 后刷新模板映射 / serious eval / Stage 2 权重
 # 
@@ -3170,7 +3447,6 @@ stage2_weights = compute_sample_weights(
 )
 print("stage2 weight summary after hard profile + replay bootstrap:", np.quantile(stage2_weights, [0, 0.25, 0.5, 0.75, 1]))
 
-
 # %% [markdown]
 # ## Cell 21 — Stage 2 训练（多轮重加权，而非轮间重建数据资产）
 
@@ -3211,26 +3487,20 @@ def refresh_stage2_assets_for_round(current_model: torch.nn.Module, completed_ro
     }
 
 
-model, stage2_last_pred_df, replay_buffer = train_stage2_with_reweight(
-    model=model,
-    train_dataset=stage2_ds,
-    eval_dataset=valid_ds,
-    train_records_df=stage2_records,
-    initial_weights=stage2_weights,
-    replay_buffer=replay_buffer,
-    refresh_assets_fn=refresh_stage2_assets_for_round,
-)
-
-
-# Cell 21.5
-if cfg.save_final_snapshot_before_post_eval:
-    save_adapter_snapshot(
-        model,
-        tokenizer,
-        str(Path(cfg.snapshot_root_dir) / "after_stage2_train"),
-        tag="after_stage2_train",
+if cfg.smoke_test_mode and cfg.smoke_profile == "fast":
+    print("[smoke-fast] skip stage2 training with reweight")
+    stage2_last_pred_df = pd.DataFrame()
+else:
+    print("[smoke] run stage2 main loop" if cfg.smoke_test_mode else "run stage2 training with reweight")
+    model, stage2_last_pred_df, replay_buffer = train_stage2_with_reweight(
+        model=model,
+        train_dataset=stage2_ds,
+        eval_dataset=valid_ds,
+        train_records_df=stage2_records,
+        initial_weights=stage2_weights,
+        replay_buffer=replay_buffer,
+        refresh_assets_fn=refresh_stage2_assets_for_round,
     )
-    cleanup_cuda()
 
 # Cell 22A
 def safe_post_eval_block(name: str, fn, fail_open: bool = True):
@@ -3364,17 +3634,46 @@ else:
 
 
 # Cell 22.9
+def _candidate_eval_target_device() -> str:
+    return "cuda:0" if torch.cuda.is_available() else "cpu"
+
+
+def _cleanup_after_candidate_eval() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+
+
+def _strip_hf_device_map(model: torch.nn.Module) -> None:
+    if hasattr(model, "hf_device_map"):
+        try:
+            delattr(model, "hf_device_map")
+        except Exception:
+            try:
+                model.hf_device_map = None
+            except Exception:
+                pass
+
+
 def load_backbone_model_for_adapter_eval() -> torch.nn.Module:
     cleanup_cuda_before_model_load()
 
     quant_config = build_quant_config()
     attn_implementation = resolve_attn_implementation()
+    target_device = _candidate_eval_target_device()
 
     attempt_specs: List[Dict[str, Any]] = []
     if quant_config is not None:
         attempt_specs.append(
             {
-                "label": "candidate_eval_quantized",
+                "label": "candidate_eval_quantized_single_gpu",
                 "quant_config": quant_config,
                 "attn_implementation": attn_implementation,
             }
@@ -3382,7 +3681,7 @@ def load_backbone_model_for_adapter_eval() -> torch.nn.Module:
 
     attempt_specs.append(
         {
-            "label": "candidate_eval_nonquant_fallback",
+            "label": "candidate_eval_nonquant_single_device",
             "quant_config": None,
             "attn_implementation": attn_implementation,
         }
@@ -3394,15 +3693,45 @@ def load_backbone_model_for_adapter_eval() -> torch.nn.Module:
     for spec in attempt_specs:
         cleanup_cuda_before_model_load(verbose=True)
         try:
-            print(f"[candidate-reload] trying load mode: {spec['label']}")
+            print(f"[candidate-reload] trying load mode: {spec['label']} on {target_device}")
+
+            load_kwargs = build_model_load_kwargs(
+                quant_config=spec["quant_config"],
+                attn_implementation=spec["attn_implementation"],
+            )
+
+            # ===== 关键修复 =====
+            # 训练时可以自动 device map，但 candidate rerank 这里不要再让 accelerate 介入自动平衡
+            # 否则在 PEFT 挂 adapter 时容易触发 get_balanced_memory -> unhashable set
+            load_kwargs.pop("max_memory", None)
+            load_kwargs.pop("offload_folder", None)
+            load_kwargs.pop("offload_state_dict", None)
+
+            if spec["quant_config"] is not None:
+                # 量化时显式单卡加载；后面会剥离 hf_device_map，避免 PEFT 再触发 accelerate 自动逻辑
+                load_kwargs["device_map"] = {"": 0} if torch.cuda.is_available() else None
+            else:
+                # 非量化 fallback 明确不走 auto device map，后面手动 to(device)
+                load_kwargs["device_map"] = None
+                load_kwargs["torch_dtype"] = torch.bfloat16 if cfg.use_bf16 else torch.float16
+
             base_model = AutoModelForCausalLM.from_pretrained(
                 cfg.base_model,
-                **build_model_load_kwargs(
-                    quant_config=spec["quant_config"],
-                    attn_implementation=spec["attn_implementation"],
-                ),
+                **load_kwargs,
             )
-            break
+
+            # 非量化 fallback：手动放到单设备
+            if spec["quant_config"] is None:
+                base_model = base_model.to(target_device)
+
+            # 非常关键：去掉 hf_device_map，防止后续 PeftModel.from_pretrained 再走 accelerate 平衡内存逻辑
+            _strip_hf_device_map(base_model)
+
+            force_nemotron_torch_fallback(base_model, tag="candidate_eval_backbone")
+            base_model.config.use_cache = False
+            base_model.eval()
+            return base_model
+
         except Exception as exc:
             errors.append(f"{spec['label']}: {type(exc).__name__}: {exc}")
             if base_model is not None:
@@ -3411,37 +3740,51 @@ def load_backbone_model_for_adapter_eval() -> torch.nn.Module:
                 except Exception:
                     pass
                 base_model = None
-            gc.collect()
-            if torch.cuda.is_available():
-                try:
-                    torch.cuda.empty_cache()
-                except Exception:
-                    pass
-                try:
-                    torch.cuda.ipc_collect()
-                except Exception:
-                    pass
+            _cleanup_after_candidate_eval()
 
-    if base_model is None:
-        raise RuntimeError(
-            "Unable to reload base model for candidate evaluation.\n"
-            "Attempts:\n" + "\n".join(errors)
-        )
-
-    force_nemotron_torch_fallback(base_model, tag="candidate_eval_backbone")
-    base_model.config.use_cache = False
-    base_model.eval()
-    return base_model
+    raise RuntimeError(
+        "Unable to reload base model for candidate evaluation.\n"
+        "Attempts:\n" + "\n".join(errors)
+    )
 
 
 def load_candidate_adapter_for_eval(adapter_dir: str) -> torch.nn.Module:
     backbone = load_backbone_model_for_adapter_eval()
+    target_device = _candidate_eval_target_device()
+
+    # 再保险：清掉底座模型上的 hf_device_map
+    _strip_hf_device_map(backbone)
+
     candidate_model = PeftModel.from_pretrained(
         backbone,
         adapter_dir,
         is_trainable=False,
+        torch_device=target_device,
+        device_map=None,
+        max_memory=None,
+        low_cpu_mem_usage=False,
     )
-    force_nemotron_torch_fallback(candidate_model, tag=f"candidate_eval::{Path(adapter_dir).name}")
+
+    # 再保险：清掉 candidate 模型上的 hf_device_map
+    _strip_hf_device_map(candidate_model)
+
+    # 非量化模型可安全 to(device)；量化模型不要强行 to，避免 bitsandbytes 报错
+    is_quantized = bool(
+        getattr(candidate_model, "is_loaded_in_4bit", False)
+        or getattr(candidate_model, "is_loaded_in_8bit", False)
+        or getattr(backbone, "is_loaded_in_4bit", False)
+        or getattr(backbone, "is_loaded_in_8bit", False)
+    )
+    if not is_quantized:
+        try:
+            candidate_model = candidate_model.to(target_device)
+        except Exception:
+            pass
+
+    force_nemotron_torch_fallback(
+        candidate_model,
+        tag=f"candidate_eval::{Path(adapter_dir).name}",
+    )
     candidate_model.config.use_cache = False
     candidate_model.eval()
     return candidate_model
@@ -3501,71 +3844,110 @@ def rerank_topk_candidates(candidate_df: pd.DataFrame) -> pd.DataFrame:
             f"step={cand.step} | local_acc={cand.local_accuracy:.4f} | dir={candidate_dir}"
         )
 
-        candidate_model = load_candidate_adapter_for_eval(candidate_dir)
-
-        serious_acc, serious_pred_df, serious_multi_seed_df = run_serious_eval_suite(
-            candidate_model,
-            rerank_eval_df,
-            serious_eval_views,
-            prefix=f"final_rerank_{Path(candidate_dir).name}",
-            run_multi_seed=True,
-        )
-
-        multi_seed_summary = summarize_multi_seed_result(serious_multi_seed_df)
-
-        if cfg.final_rerank_run_submission_style and not rerank_submission_df.empty:
-            submission_style_acc, _ = offline_submission_style_eval(
-                candidate_model,
-                rerank_submission_df,
-                top_k=cfg.test_time_router_top_k,
-            )
-        else:
-            submission_style_acc = float("nan")
-
-        rows.append(
-            {
-                "step": int(cand.step),
-                "local_accuracy": float(cand.local_accuracy),
-                "candidate_dir": candidate_dir,
-                "serious_accuracy": float(serious_acc),
-                "multi_seed_mean_accuracy": float(multi_seed_summary["multi_seed_mean_accuracy"]),
-                "multi_seed_accuracy_std": float(multi_seed_summary["multi_seed_accuracy_std"]),
-                "submission_style_accuracy": float(submission_style_acc),
-            }
-        )
-
+        candidate_model = None
         try:
-            del candidate_model
-        except Exception:
-            pass
-        cleanup_cuda()
+            candidate_model = load_candidate_adapter_for_eval(candidate_dir)
+
+            serious_acc, serious_pred_df, serious_multi_seed_df = run_serious_eval_suite(
+                candidate_model,
+                rerank_eval_df,
+                serious_eval_views,
+                prefix=f"final_rerank_{Path(candidate_dir).name}",
+                run_multi_seed=True,
+            )
+
+            multi_seed_summary = summarize_multi_seed_result(serious_multi_seed_df)
+
+            if cfg.final_rerank_run_submission_style and not rerank_submission_df.empty:
+                submission_style_acc, _ = offline_submission_style_eval(
+                    candidate_model,
+                    rerank_submission_df,
+                    top_k=cfg.test_time_router_top_k,
+                )
+            else:
+                submission_style_acc = float("nan")
+
+            rows.append(
+                {
+                    "step": int(cand.step),
+                    "local_accuracy": float(cand.local_accuracy),
+                    "candidate_dir": candidate_dir,
+                    "serious_accuracy": float(serious_acc),
+                    "multi_seed_mean_accuracy": float(multi_seed_summary["multi_seed_mean_accuracy"]),
+                    "multi_seed_accuracy_std": float(multi_seed_summary["multi_seed_accuracy_std"]),
+                    "submission_style_accuracy": float(submission_style_acc),
+                    "rerank_status": "ok",
+                    "rerank_error": "",
+                }
+            )
+
+        except Exception as exc:
+            print(f"[final-rerank][warning] failed for {candidate_dir}: {type(exc).__name__}: {exc}")
+            rows.append(
+                {
+                    "step": int(cand.step),
+                    "local_accuracy": float(cand.local_accuracy),
+                    "candidate_dir": candidate_dir,
+                    "serious_accuracy": float("nan"),
+                    "multi_seed_mean_accuracy": float("nan"),
+                    "multi_seed_accuracy_std": float("nan"),
+                    "submission_style_accuracy": float("nan"),
+                    "rerank_status": "failed",
+                    "rerank_error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+        finally:
+            if candidate_model is not None:
+                try:
+                    del candidate_model
+                except Exception:
+                    pass
+            _cleanup_after_candidate_eval()
 
     report_df = pd.DataFrame(rows)
 
-    sort_columns = [
-        "serious_accuracy",
-        "multi_seed_mean_accuracy",
-        "multi_seed_accuracy_std",
-        "local_accuracy",
-        "step",
-    ]
-    sort_ascending = [False, False, True, False, False]
+    # 如果全部 candidate 复选失败，则回退到 local_accuracy 排序，避免整条导出链路断掉
+    valid_mask = report_df["rerank_status"].eq("ok") & report_df["serious_accuracy"].notna()
+    if not valid_mask.any():
+        print("[final-rerank][warning] all candidates failed during rerank; fallback to local_accuracy ordering.")
+        report_df = report_df.sort_values(
+            ["local_accuracy", "step"],
+            ascending=[False, False],
+        ).reset_index(drop=True)
+        report_df["final_pick_rank"] = np.arange(1, len(report_df) + 1)
+        return report_df
 
+    # 正常情况下：成功复选的排前面，失败的自动放后面
     if cfg.final_rerank_run_submission_style:
-        sort_columns = [
-            "serious_accuracy",
-            "submission_style_accuracy",
-            "multi_seed_mean_accuracy",
-            "multi_seed_accuracy_std",
-            "local_accuracy",
-            "step",
-        ]
-        sort_ascending = [False, False, False, True, False, False]
+        report_df = report_df.sort_values(
+            by=[
+                "rerank_status",
+                "serious_accuracy",
+                "submission_style_accuracy",
+                "multi_seed_mean_accuracy",
+                "multi_seed_accuracy_std",
+                "local_accuracy",
+                "step",
+            ],
+            ascending=[True, False, False, False, True, False, False],
+            na_position="last",
+        ).reset_index(drop=True)
+    else:
+        report_df = report_df.sort_values(
+            by=[
+                "rerank_status",
+                "serious_accuracy",
+                "multi_seed_mean_accuracy",
+                "multi_seed_accuracy_std",
+                "local_accuracy",
+                "step",
+            ],
+            ascending=[True, False, False, True, False, False],
+            na_position="last",
+        ).reset_index(drop=True)
 
-    report_df = report_df.sort_values(sort_columns, ascending=sort_ascending).reset_index(drop=True)
     report_df["final_pick_rank"] = np.arange(1, len(report_df) + 1)
     return report_df
-
 # %% [markdown]
 # ## Cell 23 — 保存 LoRA adapter，并检查 rank/配置是否合法
 # 
@@ -3577,29 +3959,35 @@ final_adapter_dir = Path(cfg.adapter_dir)
 if final_adapter_dir.exists():
     shutil.rmtree(final_adapter_dir, ignore_errors=True)
 
-topk_candidate_df = load_topk_candidate_manifest()
-
-if not topk_candidate_df.empty:
-    rerank_report_df = rerank_topk_candidates(topk_candidate_df)
-    rerank_report_df.to_csv(Path(cfg.final_rerank_report_path), index=False)
-
-    winner = rerank_report_df.iloc[0].to_dict()
-    winner_dir = Path(winner["candidate_dir"])
-
-    shutil.copytree(winner_dir, final_adapter_dir)
-
-    Path(cfg.final_export_info_path).write_text(
-        json.dumps(winner, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-    print("[final export] selected winner from top-k candidates:")
-    print(json.dumps(winner, ensure_ascii=False, indent=2))
-else:
-    print("[final export] no top-k candidates found; fallback to current in-memory model")
+if cfg.smoke_test_mode:
+    print("[smoke] skip top-k rerank; export current in-memory model")
     final_adapter_dir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(final_adapter_dir)
     tokenizer.save_pretrained(final_adapter_dir)
+else:
+    topk_candidate_df = load_topk_candidate_manifest()
+
+    if not topk_candidate_df.empty:
+        rerank_report_df = rerank_topk_candidates(topk_candidate_df)
+        rerank_report_df.to_csv(Path(cfg.final_rerank_report_path), index=False)
+
+        winner = rerank_report_df.iloc[0].to_dict()
+        winner_dir = Path(winner["candidate_dir"])
+
+        shutil.copytree(winner_dir, final_adapter_dir)
+
+        Path(cfg.final_export_info_path).write_text(
+            json.dumps(winner, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        print("[final export] selected winner from top-k candidates:")
+        print(json.dumps(winner, ensure_ascii=False, indent=2))
+    else:
+        print("[final export] no top-k candidates found; fallback to current in-memory model")
+        final_adapter_dir.mkdir(parents=True, exist_ok=True)
+        model.save_pretrained(final_adapter_dir)
+        tokenizer.save_pretrained(final_adapter_dir)
 
 adapter_cfg_path = final_adapter_dir / "adapter_config.json"
 assert adapter_cfg_path.exists(), "缺少 adapter_config.json，无法提交"
@@ -3619,13 +4007,70 @@ zip_path = Path(cfg.submission_zip)
 if zip_path.exists():
     zip_path.unlink()
 
+allowed_submit_files = {
+    "adapter_config.json",
+    "adapter_model.safetensors",
+    "adapter_model.bin",
+}
+
 with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-    for path in sorted(Path(cfg.adapter_dir).rglob("*")):
-        if path.is_file():
-            zf.write(path, arcname=path.relative_to(cfg.adapter_dir))
+    found = set()
+    for path in sorted(Path(cfg.adapter_dir).iterdir()):
+        if path.is_file() and path.name in allowed_submit_files:
+            zf.write(path, arcname=path.name)
+            found.add(path.name)
+
+assert "adapter_config.json" in found, "submission.zip 缺少 adapter_config.json"
+assert ("adapter_model.safetensors" in found) or ("adapter_model.bin" in found), "submission.zip 缺少 adapter 权重文件"
 
 print("submission zip:", zip_path)
+print("files packed:", sorted(found))
 print("zip size (MB):", round(zip_path.stat().st_size / 1024 / 1024, 3))
+
+
+# Cell 24.5
+def smoke_reload_exported_adapter_check(
+    adapter_dir: Path,
+    probe_df: pd.DataFrame,
+    rows: int = 2,
+) -> pd.DataFrame:
+    print(f"[smoke] reload exported adapter from: {adapter_dir}")
+    reload_model = None
+    try:
+        reload_model = load_candidate_adapter_for_eval(str(adapter_dir))
+        probe_subset = probe_df.head(min(rows, len(probe_df))).copy()
+
+        reload_acc, reload_pred_df = evaluate_accuracy(
+            reload_model,
+            probe_subset,
+            extractor_fn=fast_extract_prediction,
+        )
+        print(f"[smoke] reloaded-adapter probe accuracy: {reload_acc:.4f}")
+        return reload_pred_df
+
+    finally:
+        if reload_model is not None:
+            try:
+                del reload_model
+            except Exception:
+                pass
+        _cleanup_after_candidate_eval()
+
+# Cell 24.9
+if cfg.smoke_test_mode and cfg.smoke_profile == "pipeline" and cfg.smoke_run_export_reload_check:
+    smoke_reload_df = smoke_reload_exported_adapter_check(
+        final_adapter_dir,
+        fast_eval_df,
+        rows=cfg.smoke_export_reload_rows,
+    )
+    display(smoke_reload_df.head(10))
+    smoke_reload_df.to_csv(
+        Path(cfg.work_dir) / "smoke_reloaded_adapter_probe.csv",
+        index=False,
+    )
+else:
+    print("skip exported-adapter reload smoke check")
+
 
 # %% [markdown]
 # ## Cell 25 — 提交前 smoke test
@@ -3657,6 +4102,7 @@ for row in smoke_df.itertuples(index=False):
 smoke_pred_df = pd.DataFrame(smoke_rows)
 display(smoke_pred_df)
 smoke_pred_df.to_csv(Path(cfg.work_dir) / "smoke_predictions.csv", index=False)
+
 
 # %% [markdown]
 # ## Cell 26 — 已落地能力 vs 下一步冲奖路线

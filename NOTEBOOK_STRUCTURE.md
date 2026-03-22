@@ -99,3 +99,60 @@
    - QLoRA + A/B supervision + curriculum + hard mining + reweighting
 4. **Future improvement path**
    - synthetic data / self-distillation / RL / prompt ensemble
+
+
+cfg.smoke_test_mode = False   # 正常模式
+cfg.smoke_test_mode = True    # 进入 smoke 模式
+cfg.smoke_profile是 smoke 模式里的子模式选择器，只有在：
+cfg.smoke_test_mode = True
+时它才生效。
+可选值
+
+"fast"
+超轻量快速测试模式
+会做的事：
+测数据处理
+测 tokenizer / model / LoRA 加载
+测基础 forward / generate
+测本地 eval 函数
+测导出 zip
+不会做的事：
+不走 trainer.train()
+不走 stage2 主循环
+不测导出后 reload
+适合：
+只是想快速看 notebook 有没有明显语法/流程 bug
+改了前处理、tokenize、加载部分后快速体检
+写法：
+cfg.smoke_test_mode = True
+cfg.smoke_profile = "fast"
+
+"pipeline"
+轻量全链路测试模式
+会做的事：
+跑 stage1 的 trainer.train()
+跑 stage1 evaluate
+跑 stage2 主循环（轻量版）
+导出 adapter
+重新加载导出的 adapter 并测试推理
+不会做的事：
+不跑 heavy eval
+不跑 rerank
+不跑 template ablation
+不跑 pseudolabel refresh
+不跑多 seed 重评估
+适合：
+改了训练逻辑后检查会不会炸
+提交前检查“主链路是否能跑通”
+想抓代码级 bug，而不是追求分数
+写法：
+cfg.smoke_test_mode = True
+cfg.smoke_profile = "pipeline"
+
+
+cfg.run_supervision_ablation = True
+run_supervision_ablation 不是主训练开关，
+而是：
+“要不要额外跑 supervision 消融对照实验”的开关。
+开了它，通常会多跑训练；
+关了它，主流程更干净、更适合 smoke test 和正式提交。
