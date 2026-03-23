@@ -110,7 +110,8 @@ class CFG:
     # ===== training =====
     use_bf16: bool = True
     use_4bit: bool = True
-    max_seq_len: int = 2048
+    max_seq_len: int = 4096
+    answer_target_max_tokens: int = 256
     micro_batch_size: int = 1
     eval_batch_size: int = 1
     grad_accum: int = 16
@@ -120,7 +121,7 @@ class CFG:
     save_steps: int = 100
     eval_steps: int = 100
     max_grad_norm: float = 0.3
-    enable_gradient_checkpointing: bool = False
+    enable_gradient_checkpointing: bool = True
     force_nemotron_torch_fallback: bool = False
     cuda_load_headroom_gib: int = 6
 
@@ -140,22 +141,22 @@ class CFG:
 
     # ===== curriculum =====
     stage1_epochs: float = 0.6
-    stage2_epochs: float = 1.4
+    stage2_epochs: float = 2.0
     stage2_rounds: int = 4
     stage1_max_prompt_chars: int = 900
     stage1_lr: float = 1.6e-4
-    stage2_lr: float = 9e-5
+    stage2_lr: float = 6e-5
 
     # ===== optional leaderboard tricks =====
     enable_external_mixture: bool = True
     enable_prompt_template_ablation: bool = True
     enable_family_reweight: bool = True
     enable_length_bucket_bonus: bool = True
-    run_supervision_ablation: bool = False
+    run_supervision_ablation: bool = True
     primary_supervision_variant: str = "family_aware_mix"
     supervision_ablation_variants: Tuple[str, ...] = ("answer_only", "short_reasoning", "family_aware_mix")
-    supervision_ablation_stage1_epochs: float = 0.20
-    supervision_ablation_stage2_epochs: float = 0.20
+    supervision_ablation_stage1_epochs: float = 0.15
+    supervision_ablation_stage2_epochs: float = 0.25
     supervision_ablation_stage2_rounds: int = 1
     reasoning_template_eval_rows: int = 48
     enable_consensus_pseudolabel_refresh: bool = True
@@ -1266,24 +1267,35 @@ print("eos token:", tokenizer.eos_token)
 # %%
 def tokenize_answer_only(example: Dict[str, Any]) -> Dict[str, Any]:
     target_key = "reasoning_full_text" if example.get("supervision_variant") == "short_reasoning" else "full_text"
-    prompt_enc = tokenizer(
-        example["prompt_text"],
-        add_special_tokens=False,
-        truncation=True,
-        max_length=cfg.max_seq_len,
-    )
-    full_enc = tokenizer(
-        example[target_key],
-        add_special_tokens=False,
-        truncation=True,
-        max_length=cfg.max_seq_len,
-    )
 
-    input_ids = full_enc["input_ids"]
-    attention_mask = full_enc["attention_mask"]
-    prompt_len = min(len(prompt_enc["input_ids"]), len(input_ids))
-    labels = input_ids.copy()
-    labels[:prompt_len] = [-100] * prompt_len
+    prompt_text = example["prompt_text"]
+    full_text = example[target_key]
+
+    # full_text = prompt_text + target_suffix
+    target_suffix = full_text[len(prompt_text):] + tokenizer.eos_token
+
+    prompt_ids = tokenizer(
+        prompt_text,
+        add_special_tokens=False,
+        truncation=False,
+    )["input_ids"]
+
+    target_ids = tokenizer(
+        target_suffix,
+        add_special_tokens=False,
+        truncation=False,
+    )["input_ids"]
+
+    # 先保答案，再裁 prompt；避免长 prompt 把答案全部挤没
+    target_ids = target_ids[: cfg.answer_target_max_tokens]
+    prompt_budget = max(cfg.max_seq_len - len(target_ids), 0)
+
+    # 保留 prompt 末尾
+    prompt_ids = prompt_ids[-prompt_budget:]
+
+    input_ids = prompt_ids + target_ids
+    attention_mask = [1] * len(input_ids)
+    labels = [-100] * len(prompt_ids) + target_ids.copy()
 
     return {
         "input_ids": input_ids,
@@ -1303,11 +1315,18 @@ def tokenize_answer_only(example: Dict[str, Any]) -> Dict[str, Any]:
 
 def make_supervision_frame(df: pd.DataFrame, supervision_variant: str) -> pd.DataFrame:
     tmp = df.copy()
+
     if supervision_variant == "family_aware_mix":
-        # 只让真正偏结构推理、且答案不是 text 的样本继续走 short_reasoning
         use_short_reasoning = (
-            tmp["prompt_family"].isin({"matrix_reasoning"})
+            tmp["prompt_family"].isin({"matrix_reasoning", "sequence", "fewshot_pattern"})
             & tmp["answer_type"].isin({"numeric", "binary"})
+        )
+
+        # 对较长的 open_template 数值题，也给一点轻量 reasoning scaffold
+        use_short_reasoning |= (
+            tmp["prompt_family"].eq("open_template")
+            & tmp["answer_type"].eq("numeric")
+            & tmp["prompt_chars"].ge(600)
         )
 
         tmp["supervision_variant"] = np.where(
@@ -1317,6 +1336,7 @@ def make_supervision_frame(df: pd.DataFrame, supervision_variant: str) -> pd.Dat
         )
     else:
         tmp["supervision_variant"] = supervision_variant
+
     return tmp
 
 def build_variant_datasets(records_df: pd.DataFrame, variant: str) -> Dataset:
@@ -1405,6 +1425,15 @@ valid_ds = valid_variant_ds[cfg.primary_supervision_variant]
 
 print(stage2_ds[0].keys())
 print("non-masked labels:", sum(x != -100 for x in stage2_ds[0]["labels"]))
+
+sample_non_masked = [
+    sum(x != -100 for x in stage2_ds[i]["labels"])
+    for i in range(min(64, len(stage2_ds)))
+]
+print("stage2 non-masked label stats:")
+print("min =", min(sample_non_masked))
+print("mean =", float(np.mean(sample_non_masked)))
+print("p10 =", float(np.quantile(sample_non_masked, 0.1)))
 
 
 
@@ -2090,7 +2119,20 @@ def generate_answer_text(model: torch.nn.Module, prompt: str, max_new_tokens: in
         if prev_use_cache is not None:
             model.config.use_cache = True
 
-        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+        # 推理时也和训练一样：优先保留 prompt 末尾
+        prompt_ids = tokenizer(
+            prompt,
+            add_special_tokens=False,
+            truncation=False,
+        )["input_ids"]
+
+        prompt_budget = max(min(cfg.max_seq_len, cfg.official_max_model_len - max_new_tokens), 1)
+        prompt_ids = prompt_ids[-prompt_budget:]
+
+        inputs = {
+            "input_ids": torch.tensor([prompt_ids], dtype=torch.long, device=model.device),
+            "attention_mask": torch.ones((1, len(prompt_ids)), dtype=torch.long, device=model.device),
+        }
         input_len = inputs["input_ids"].shape[1]
 
         outputs = model.generate(
@@ -2098,6 +2140,7 @@ def generate_answer_text(model: torch.nn.Module, prompt: str, max_new_tokens: in
             max_new_tokens=max_new_tokens,
             do_sample=False,
             pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
         )
 
         gen_ids = outputs[0][input_len:]
@@ -2108,7 +2151,6 @@ def generate_answer_text(model: torch.nn.Module, prompt: str, max_new_tokens: in
             model.config.use_cache = prev_use_cache
         if prev_training:
             model.train()
-
 
 @torch.no_grad()
 def inspect_generation_completion_sanity(
@@ -3002,11 +3044,10 @@ def build_training_args(stage_name: str, lr: float, epochs: float) -> TrainingAr
         num_train_epochs=epochs,
         learning_rate=lr,
         lr_scheduler_type="cosine",
-        warmup_steps=cfg.warmup_steps_override or 0,
         per_device_train_batch_size=cfg.micro_batch_size,
         per_device_eval_batch_size=cfg.eval_batch_size,
         gradient_accumulation_steps=cfg.grad_accum,
-        gradient_checkpointing=False,
+        gradient_checkpointing=cfg.enable_gradient_checkpointing,
         eval_strategy="steps",
         save_strategy="steps",
         eval_steps=cfg.eval_steps,
@@ -3022,6 +3063,11 @@ def build_training_args(stage_name: str, lr: float, epochs: float) -> TrainingAr
         save_total_limit=2,
         load_best_model_at_end=False,
     )
+
+    if cfg.warmup_steps_override is not None:
+        kwargs["warmup_steps"] = int(cfg.warmup_steps_override)
+    else:
+        kwargs["warmup_ratio"] = cfg.warmup_ratio
 
     if max_steps is not None and int(max_steps) > 0:
         kwargs["max_steps"] = int(max_steps)
