@@ -93,7 +93,7 @@ class CFG:
     submission_zip: str = "/kaggle/working/submission.zip"
 
     # ===== candidate / final selection =====
-    topk_candidate_keep: int = 5
+    topk_candidate_keep: int = 8
     topk_candidate_dir: str = "/kaggle/working/nemotron_advanced/topk_candidates"
     topk_candidate_manifest_path: str = "/kaggle/working/nemotron_advanced/topk_candidates_manifest.csv"
     final_rerank_report_path: str = "/kaggle/working/nemotron_advanced/final_rerank_report.csv"
@@ -101,8 +101,16 @@ class CFG:
     snapshot_root_dir: str = "/kaggle/working/nemotron_advanced/snapshots"
     best_score_epsilon: float = 1e-12
     topk_min_global_step: int = 0
-    final_rerank_run_submission_style: bool = False
-    final_rerank_submission_rows: int = 128
+    final_rerank_run_submission_style: bool = True
+    final_rerank_submission_rows: int = 192
+
+    # ===== stage1 -> stage2 inheritance =====
+    stage2_inherit_best_stage1_candidate: bool = True
+    stage2_inherit_fallback_to_final_stage1_state: bool = True
+
+    stage1_inherit_use_serious_rerank: bool = True
+    stage1_inherit_serious_top_n: int = 3
+    stage1_inherit_serious_eval_rows: int = 128
 
     # ===== reproducibility =====
     seed: int = 3407
@@ -140,12 +148,12 @@ class CFG:
     official_metric_backend_path: Optional[str] = None
 
     # ===== curriculum =====
-    stage1_epochs: float = 0.6
-    stage2_epochs: float = 2.0
-    stage2_rounds: int = 4
+    stage1_epochs: float = 0.8
+    stage2_epochs: float = 3.0
+    stage2_rounds: int = 6
     stage1_max_prompt_chars: int = 900
-    stage1_lr: float = 1.6e-4
-    stage2_lr: float = 6e-5
+    stage1_lr: float = 1.2e-4
+    stage2_lr: float = 4e-5
 
     # ===== optional leaderboard tricks =====
     enable_external_mixture: bool = True
@@ -160,7 +168,7 @@ class CFG:
     supervision_ablation_stage2_rounds: int = 1
     reasoning_template_eval_rows: int = 48
     enable_consensus_pseudolabel_refresh: bool = True
-    consensus_pseudolabel_max_rows: int = 192
+    consensus_pseudolabel_max_rows: int = 320
     consensus_pseudolabel_allowed_families: Tuple[str, ...] = ("bit_transform", "sequence", "matrix_reasoning")
     consensus_template_ids: Tuple[str, ...] = (
         "T1_ultra_compact",
@@ -168,10 +176,10 @@ class CFG:
         "T4_numeric_specialized",
         "T5_text_specialized",
     )
-    template_router_top_k: int = 3
-    test_time_router_top_k: int = 3
+    template_router_top_k: int = 4
+    test_time_router_top_k: int = 4
     fallback_template_id: str = "T2_compact"
-    pseudolabel_min_confidence: float = 0.85
+    pseudolabel_min_confidence: float = 0.90
     pseudolabel_source_loss_weight: float = 0.4
     hard_mining_bottom_family_k: int = 5
     hard_mining_bottom_answer_type_k: int = 3
@@ -210,7 +218,7 @@ class CFG:
     post_eval_fail_open: bool = True
 
     # ===== smoke test mode =====
-    smoke_test_mode: bool = True
+    smoke_test_mode: bool = False
     smoke_train_rows: int = 24
     smoke_valid_rows: int = 12
     smoke_fast_eval_rows: int = 8
@@ -242,6 +250,18 @@ class CFG:
 
 cfg = CFG()
 cfg.force_nemotron_torch_fallback = True
+
+cfg.run_tag = f"seed{cfg.seed}"
+
+cfg.work_dir = f"/kaggle/working/nemotron_advanced_{cfg.run_tag}"
+cfg.output_dir = f"{cfg.work_dir}/checkpoints"
+cfg.adapter_dir = f"{cfg.work_dir}/adapter"
+cfg.topk_candidate_dir = f"{cfg.work_dir}/topk_candidates"
+cfg.topk_candidate_manifest_path = f"{cfg.work_dir}/topk_candidates_manifest.csv"
+cfg.final_rerank_report_path = f"{cfg.work_dir}/final_rerank_report.csv"
+cfg.final_export_info_path = f"{cfg.work_dir}/final_export_info.json"
+cfg.snapshot_root_dir = f"{cfg.work_dir}/snapshots"
+cfg.submission_zip = f"/kaggle/working/submission_{cfg.run_tag}.zip"
 
 if cfg.smoke_test_mode:
     print(f"SMOKE TEST MODE ENABLED: profile={cfg.smoke_profile}")
@@ -3039,11 +3059,25 @@ def build_training_args(stage_name: str, lr: float, epochs: float) -> TrainingAr
         elif stage_name.startswith("stage2"):
             max_steps = cfg.smoke_train_max_steps_stage2
 
+    # ===== 用真实 warmup_steps，不再用 warmup_ratio =====
+    if stage_name.startswith("stage1"):
+        train_rows = max(len(stage1_ds), 1)
+        warmup_frac = 0.05
+    else:
+        train_rows = max(len(stage2_ds), 1)
+        warmup_frac = 0.08
+
+    effective_batch = max(cfg.micro_batch_size * cfg.grad_accum, 1)
+    steps_per_epoch = max(math.ceil(train_rows / effective_batch), 1)
+    est_total_steps = max(int(math.ceil(epochs * steps_per_epoch)), 1)
+    auto_warmup_steps = max(int(round(est_total_steps * warmup_frac)), 1)
+
     kwargs = dict(
         output_dir=str(Path(cfg.output_dir) / stage_name),
         num_train_epochs=epochs,
         learning_rate=lr,
         lr_scheduler_type="cosine",
+        warmup_steps=int(cfg.warmup_steps_override) if cfg.warmup_steps_override is not None else auto_warmup_steps,
         per_device_train_batch_size=cfg.micro_batch_size,
         per_device_eval_batch_size=cfg.eval_batch_size,
         gradient_accumulation_steps=cfg.grad_accum,
@@ -3063,11 +3097,6 @@ def build_training_args(stage_name: str, lr: float, epochs: float) -> TrainingAr
         save_total_limit=2,
         load_best_model_at_end=False,
     )
-
-    if cfg.warmup_steps_override is not None:
-        kwargs["warmup_steps"] = int(cfg.warmup_steps_override)
-    else:
-        kwargs["warmup_ratio"] = cfg.warmup_ratio
 
     if max_steps is not None and int(max_steps) > 0:
         kwargs["max_steps"] = int(max_steps)
@@ -3470,6 +3499,151 @@ if not cfg.smoke_test_mode:
         if p.exists():
             p.unlink()
 
+# Cell 18.95 — Stage1 best checkpoint -> Stage2 inheritance (OOM-safe, in-place adapter reload)
+
+from peft.utils.save_and_load import load_peft_weights, set_peft_model_state_dict
+
+
+def pick_best_stage1_candidate_dir() -> Optional[str]:
+    manifest_path = Path(cfg.topk_candidate_manifest_path)
+    if not manifest_path.exists():
+        print(f"[stage2 inherit] manifest not found: {manifest_path}")
+        return None
+
+    candidate_df = pd.read_csv(manifest_path)
+    if candidate_df.empty:
+        print("[stage2 inherit] manifest is empty")
+        return None
+
+    candidate_df = candidate_df.loc[
+        candidate_df["candidate_dir"].map(lambda p: Path(p).exists())
+    ].copy()
+
+    if candidate_df.empty:
+        print("[stage2 inherit] no candidate_dir exists on disk")
+        return None
+
+    candidate_df = candidate_df.sort_values(
+        ["local_accuracy", "step"],
+        ascending=[False, False],
+    ).reset_index(drop=True)
+
+    best_dir = str(candidate_df.iloc[0]["candidate_dir"])
+    best_step = int(candidate_df.iloc[0]["step"])
+    best_acc = float(candidate_df.iloc[0]["local_accuracy"])
+    print(
+        f"[stage2 inherit] pick best Stage1 candidate: "
+        f"step={best_step}, local_acc={best_acc:.4f}, dir={best_dir}"
+    )
+    return best_dir
+
+
+def _get_active_adapter_name(model: torch.nn.Module) -> str:
+    adapter_name = "default"
+    try:
+        active_adapter = getattr(model, "active_adapter", None)
+        if isinstance(active_adapter, str) and active_adapter:
+            adapter_name = active_adapter
+        elif isinstance(active_adapter, (list, tuple)) and len(active_adapter) > 0:
+            adapter_name = str(active_adapter[0])
+    except Exception:
+        pass
+    return adapter_name
+
+
+def _cleanup_cuda_after_inherit() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+
+
+def load_adapter_weights_into_existing_model(model: torch.nn.Module, adapter_dir: str) -> torch.nn.Module:
+    adapter_name = _get_active_adapter_name(model)
+
+    print(f"[stage2 inherit] loading adapter weights into existing model from: {adapter_dir}")
+    print(f"[stage2 inherit] target adapter_name: {adapter_name}")
+
+    # 只加载 LoRA / PEFT 权重，不重新创建 base model
+    adapter_state_dict = load_peft_weights(adapter_dir, device="cpu")
+
+    load_result = set_peft_model_state_dict(
+        model,
+        adapter_state_dict,
+        adapter_name=adapter_name,
+    )
+
+    if load_result is not None:
+        try:
+            print(f"[stage2 inherit] set_peft_model_state_dict result: {load_result}")
+        except Exception:
+            pass
+
+    # 保持训练态
+    try:
+        model.config.use_cache = False
+    except Exception:
+        pass
+
+    try:
+        if cfg.enable_gradient_checkpointing and getattr(model, "supports_gradient_checkpointing", False):
+            model.gradient_checkpointing_enable()
+    except Exception as exc:
+        print(f"[stage2 inherit] gradient_checkpointing_enable skipped: {exc}")
+
+    model.train()
+    return model
+
+
+def maybe_reload_best_stage1_candidate_for_stage2(model: torch.nn.Module) -> torch.nn.Module:
+    if not cfg.stage2_inherit_best_stage1_candidate:
+        print("[stage2 inherit] disabled by cfg")
+        return model
+
+    best_dir = pick_best_stage1_candidate_dir()
+    if best_dir is None:
+        print("[stage2 inherit] no best candidate found")
+        if cfg.stage2_inherit_fallback_to_final_stage1_state:
+            print("[stage2 inherit] fallback to final Stage1 in-memory model")
+            return model
+        raise RuntimeError("Stage2 inheritance failed: no reloadable Stage1 candidate")
+
+    # 尽量释放 trainer / collator 对旧 stage1 训练对象的引用，但不要删 model 本体
+    global trainer_stage1, collator
+
+    if "trainer_stage1" in globals():
+        try:
+            if hasattr(trainer_stage1, "model"):
+                trainer_stage1.model = None
+        except Exception:
+            pass
+        try:
+            del trainer_stage1
+        except Exception:
+            pass
+
+    if "collator" in globals() and collator is not None:
+        try:
+            if hasattr(collator, "model"):
+                collator.model = None
+        except Exception:
+            pass
+
+    _cleanup_cuda_after_inherit()
+
+    # ===== 关键修复：原地覆盖 adapter 权重，不重新加载一整份 base model =====
+    model = load_adapter_weights_into_existing_model(model, best_dir)
+
+    _cleanup_cuda_after_inherit()
+
+    print(f"[stage2 inherit] loaded best Stage1 adapter into existing model from: {best_dir}")
+    return model
 
 # %% [markdown]
 # ## Cell 19 — Stage 1 训练（短 / 规则明显 family 先收敛）
@@ -3552,6 +3726,18 @@ else:
 # - Sample-level replay 在进入 Stage 2 前先用训练 probe 错题做一次 bootstrap。
 
 # %%
+# ===== NEW: Stage2 改成继承 Stage1 最优 checkpoint，而不是最后状态 =====
+model = maybe_reload_best_stage1_candidate_for_stage2(model)
+
+# 重新绑定 collator，避免它还引用旧模型
+collator = DataCollatorForSeq2Seq(
+    tokenizer=tokenizer,
+    model=model,
+    padding=True,
+    pad_to_multiple_of=8,
+    return_tensors="pt",
+)
+
 stage1_acc, stage1_pred_df, stage1_multi_seed_df = run_serious_eval_suite(
     model,
     serious_eval_df,
@@ -4111,8 +4297,23 @@ def rerank_topk_candidates(candidate_df: pd.DataFrame) -> pd.DataFrame:
         report_df["final_pick_rank"] = np.arange(1, len(report_df) + 1)
         return report_df
 
-    # 正常情况下：成功复选的排前面，失败的自动放后面
+    # ===== 修复：开了 submission-style rerank 时，必须把 submission_style_accuracy 纳入排序 =====
     if cfg.final_rerank_run_submission_style:
+        report_df = report_df.sort_values(
+            by=[
+                "rerank_status",
+                "serious_accuracy",
+                "submission_style_accuracy",
+                "short_text_accuracy",
+                "multi_seed_mean_accuracy",
+                "multi_seed_accuracy_std",
+                "local_accuracy",
+                "step",
+            ],
+            ascending=[True, False, False, False, False, True, False, False],
+            na_position="last",
+        ).reset_index(drop=True)
+    else:
         report_df = report_df.sort_values(
             by=[
                 "rerank_status",
@@ -4124,21 +4325,6 @@ def rerank_topk_candidates(candidate_df: pd.DataFrame) -> pd.DataFrame:
                 "step",
             ],
             ascending=[True, False, False, False, True, False, False],
-            na_position="last",
-        ).reset_index(drop=True)
-    else:
-        report_df = report_df.sort_values(
-            by=[
-                "rerank_status",
-                "serious_accuracy",
-                "short_text_accuracy",
-                "submission_style_accuracy",
-                "multi_seed_mean_accuracy",
-                "multi_seed_accuracy_std",
-                "local_accuracy",
-                "step",
-            ],
-            ascending=[True, False, False, False, False, True, False, False],
             na_position="last",
         ).reset_index(drop=True)
 
