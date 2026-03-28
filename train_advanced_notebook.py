@@ -126,7 +126,7 @@ class CFG:
     grad_accum: int = 16
     warmup_ratio: float = 0.05
     weight_decay: float = 0.01
-    logging_steps: int = 10
+    logging_steps: int = 50
     save_steps: int = 100
     eval_steps: int = 100
     max_grad_norm: float = 0.3
@@ -177,7 +177,7 @@ class CFG:
     supervision_ablation_stage2_epochs: float = 0.25
     supervision_ablation_stage2_rounds: int = 1
     reasoning_template_eval_rows: int = 48
-    enable_consensus_pseudolabel_refresh: bool = True
+    enable_consensus_pseudolabel_refresh: bool = False
     consensus_pseudolabel_max_rows: int = 320
     consensus_pseudolabel_allowed_families: Tuple[str, ...] = ("bit_transform", "sequence", "matrix_reasoning")
     consensus_template_ids: Tuple[str, ...] = (
@@ -219,8 +219,10 @@ class CFG:
     hard_mining_bucket_boost: float = 0.20
     hard_mining_sample_boost: float = 0.55
     replay_probe_rows: int = 128
-    short_text_weight_boost: float = 1.25
-    open_template_short_text_extra_boost: float = 1.10
+    short_text_weight_boost: float = 1.45
+    open_template_short_text_extra_boost: float = 1.30
+    cipher_decrypt_weight_boost: float = 1.35
+    multi_token_text_weight_boost: float = 1.15
     allow_target_auto_discovery: bool = False
 
     # ===== runtime control =====
@@ -1069,21 +1071,21 @@ TEMPLATE_POOL = {
 
 FAMILY_TEMPLATE_PRIORS: Dict[str, str] = {
     "bit_transform": "T4_numeric_specialized",
-    "cipher_decrypt": "T5_text_specialized",
+    "cipher_decrypt": "T3_hidden_reasoning",
     "fewshot_pattern": "T3_hidden_reasoning",
     "matrix_reasoning": "T3_hidden_reasoning",
     "sequence": "T4_numeric_specialized",
-    "open_template": "T1_ultra_compact",
+    "open_template": "T5_text_specialized",
 }
 BEST_TEMPLATE_BY_FAMILY: Dict[str, str] = dict(FAMILY_TEMPLATE_PRIORS)
 FAMILY_TEMPLATE_ROUTER: Dict[str, List[str]] = {
     "bit_transform": ["T4_numeric_specialized", "T1_ultra_compact", "T3_hidden_reasoning"],
-    "cipher_decrypt": ["T5_text_specialized", "T1_ultra_compact"],
+    "cipher_decrypt": ["T3_hidden_reasoning", "T5_text_specialized", "T1_ultra_compact"],
     "fewshot_pattern": ["T3_hidden_reasoning", "T1_ultra_compact", "T4_numeric_specialized"],
     "matrix_reasoning": ["T3_hidden_reasoning", "T4_numeric_specialized", "T1_ultra_compact"],
     "sequence": ["T3_hidden_reasoning", "T1_ultra_compact", "T4_numeric_specialized"],
-    "open_template": ["T1_ultra_compact", "T5_text_specialized"],
-    "default": ["T1_ultra_compact", "T3_hidden_reasoning", "T4_numeric_specialized"],
+    "open_template": ["T5_text_specialized", "T1_ultra_compact", "T3_hidden_reasoning", "T4_numeric_specialized"],
+    "default": ["T1_ultra_compact", "T5_text_specialized", "T3_hidden_reasoning", "T4_numeric_specialized"],
 }
 BEST_TEMPLATE_ROUTER_BY_FAMILY: Dict[str, List[str]] = {
     family: list(router) for family, router in FAMILY_TEMPLATE_ROUTER.items()
@@ -1092,17 +1094,27 @@ CURRENT_WEAK_FAMILIES: List[str] = []
 
 
 def choose_template_id(answer_type: str, prompt_family: str) -> str:
-    if prompt_family in BEST_TEMPLATE_BY_FAMILY:
-        return BEST_TEMPLATE_BY_FAMILY[prompt_family]
+    # 先按“题型 + 答案类型”走强规则，不要先被 family prior 锁死
+    if prompt_family == "cipher_decrypt":
+        if answer_type in {"short_text", "multi_token_text"}:
+            return "T3_hidden_reasoning"
+        return "T5_text_specialized"
+
+    if prompt_family == "open_template":
+        if answer_type in {"short_text", "multi_token_text"}:
+            return "T5_text_specialized"
+        if answer_type in {"numeric", "binary"}:
+            return "T4_numeric_specialized"
+        return "T1_ultra_compact"
 
     if answer_type in {"numeric", "binary"}:
         return "T4_numeric_specialized"
 
-    if prompt_family == "cipher_decrypt":
-        return "T5_text_specialized"
-
     if answer_type in {"short_text", "multi_token_text"}:
         return "T5_text_specialized"
+
+    if prompt_family in BEST_TEMPLATE_BY_FAMILY:
+        return BEST_TEMPLATE_BY_FAMILY[prompt_family]
 
     if not cfg.enable_prompt_template_ablation:
         return "T2_compact"
@@ -1127,11 +1139,15 @@ def router_get_templates(prompt_family: str, answer_type: Optional[str] = None, 
         candidates = preferred + candidates
 
     elif prompt_family == "open_template" and answer_type in {"short_text", "multi_token_text"}:
-        preferred = ["T1_ultra_compact", "T5_text_specialized"]
+        preferred = ["T5_text_specialized", "T3_hidden_reasoning", "T1_ultra_compact"]
         candidates = preferred + candidates
 
-    elif prompt_family == "cipher_decrypt" or answer_type in {"short_text", "multi_token_text"}:
-        preferred = ["T5_text_specialized", "T1_ultra_compact"]
+    elif prompt_family == "cipher_decrypt":
+        preferred = ["T3_hidden_reasoning", "T5_text_specialized", "T1_ultra_compact"]
+        candidates = preferred + candidates
+
+    elif answer_type in {"short_text", "multi_token_text"}:
+        preferred = ["T5_text_specialized", "T3_hidden_reasoning", "T1_ultra_compact"]
         candidates = preferred + candidates
 
     else:
@@ -1490,10 +1506,20 @@ def make_supervision_frame(df: pd.DataFrame, supervision_variant: str) -> pd.Dat
     tmp = df.copy()
 
     if supervision_variant == "family_aware_mix":
-        # 只让真正偏结构推理、且答案不是 text 的样本继续走 short_reasoning
         use_short_reasoning = (
-            tmp["prompt_family"].isin({"matrix_reasoning"})
+            tmp["prompt_family"].eq("matrix_reasoning")
             & tmp["answer_type"].isin({"numeric", "binary"})
+        )
+
+        use_short_reasoning |= (
+            tmp["prompt_family"].eq("cipher_decrypt")
+            & tmp["answer_type"].isin({"short_text", "multi_token_text"})
+        )
+
+        use_short_reasoning |= (
+            tmp["prompt_family"].eq("open_template")
+            & tmp["answer_type"].isin({"short_text", "multi_token_text"})
+            & tmp["prompt_chars"].ge(220)
         )
 
         tmp["supervision_variant"] = np.where(
@@ -2158,8 +2184,15 @@ def compute_sample_weights(
 
         if row.answer_type == "short_text":
             weight *= cfg.short_text_weight_boost
-            if row.prompt_family == "open_template":
-                weight *= cfg.open_template_short_text_extra_boost
+
+        if row.answer_type == "multi_token_text":
+            weight *= cfg.multi_token_text_weight_boost
+
+        if row.prompt_family == "open_template" and row.answer_type in {"short_text", "multi_token_text"}:
+            weight *= cfg.open_template_short_text_extra_boost
+
+        if row.prompt_family == "cipher_decrypt":
+            weight *= cfg.cipher_decrypt_weight_boost
 
         if hard_profile is not None:
             weight *= 1.0 + cfg.hard_mining_family_boost * hard_profile["family"].get(row.prompt_family, 0.0)
@@ -3246,7 +3279,7 @@ def build_training_args(stage_name: str, lr: float, epochs: float) -> TrainingAr
         weight_decay=cfg.weight_decay,
         bf16=cfg.use_bf16,
         fp16=not cfg.use_bf16,
-        dataloader_num_workers=2,
+        dataloader_num_workers=4,
         remove_unused_columns=False,
         report_to="none",
         save_total_limit=2,
@@ -3966,14 +3999,22 @@ if cfg.enable_prompt_template_ablation:
         template_eval_rows,
         seed=cfg.template_ablation_secondary_seed,
     )
-    template_score_df, family_template_map_df, family_template_full_df, template_update_decisions_df = perform_conservative_template_refresh(
+    refreshed_best_by_family, refreshed_router, family_template_full_df, template_update_decisions_df = perform_conservative_template_refresh(
         model,
         template_eval_df,
         template_secondary_eval_df,
         prefix="stage1",
     )
-    display(template_score_df)
-    display(family_template_map_df.head(20))
+
+    BEST_TEMPLATE_BY_FAMILY.clear()
+    BEST_TEMPLATE_BY_FAMILY.update(refreshed_best_by_family)
+
+    BEST_TEMPLATE_ROUTER_BY_FAMILY.clear()
+    BEST_TEMPLATE_ROUTER_BY_FAMILY.update(
+        {k: list(v) for k, v in refreshed_router.items()}
+    )
+
+    display(family_template_full_df.head(20))
     display(template_update_decisions_df.head(20))
 
 train_records, valid_records, stage2_variant_ds, valid_variant_ds, stage2_ds, valid_ds, stage2_weights, stage2_records = refresh_stage2_training_assets(
@@ -4011,13 +4052,22 @@ def refresh_stage2_assets_for_round(current_model: torch.nn.Module, completed_ro
             cfg.stage2_refresh_template_eval_rows,
             seed=cfg.template_ablation_secondary_seed + completed_round,
         )
-        _score_df, _map_df, _full_df, round_decisions_df = perform_conservative_template_refresh(
+        refreshed_best_by_family, refreshed_router, _full_df, round_decisions_df = perform_conservative_template_refresh(
             current_model,
             round_eval_df,
             round_secondary_eval_df,
             prefix=f"stage2_round_{completed_round}",
         )
-        display(round_decisions_df.head(12))
+
+        BEST_TEMPLATE_BY_FAMILY.clear()
+        BEST_TEMPLATE_BY_FAMILY.update(refreshed_best_by_family)
+
+        BEST_TEMPLATE_ROUTER_BY_FAMILY.clear()
+        BEST_TEMPLATE_ROUTER_BY_FAMILY.update(
+            {k: list(v) for k, v in refreshed_router.items()}
+        )
+
+        display(round_decisions_df.head(20))
 
     refreshed_train_records, refreshed_valid_records, refreshed_stage2_variant_ds, refreshed_valid_variant_ds, refreshed_stage2_ds, refreshed_valid_ds, refreshed_stage2_weights, refreshed_stage2_records = refresh_stage2_training_assets(
         train_fold,
