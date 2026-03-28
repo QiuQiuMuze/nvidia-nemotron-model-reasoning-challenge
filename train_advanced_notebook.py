@@ -93,7 +93,7 @@ class CFG:
     submission_zip: str = "/kaggle/working/submission.zip"
 
     # ===== candidate / final selection =====
-    topk_candidate_keep: int = 8
+    topk_candidate_keep: int = 12
     topk_candidate_dir: str = "/kaggle/working/nemotron_advanced/topk_candidates"
     topk_candidate_manifest_path: str = "/kaggle/working/nemotron_advanced/topk_candidates_manifest.csv"
     final_rerank_report_path: str = "/kaggle/working/nemotron_advanced/final_rerank_report.csv"
@@ -102,18 +102,19 @@ class CFG:
     best_score_epsilon: float = 1e-12
     topk_min_global_step: int = 0
     final_rerank_run_submission_style: bool = True
-    final_rerank_submission_rows: int = 192
+    final_rerank_submission_rows: int = 384
 
     # ===== stage1 -> stage2 inheritance =====
     stage2_inherit_best_stage1_candidate: bool = True
     stage2_inherit_fallback_to_final_stage1_state: bool = True
 
     stage1_inherit_use_serious_rerank: bool = True
-    stage1_inherit_serious_top_n: int = 3
-    stage1_inherit_serious_eval_rows: int = 128
+    stage1_inherit_serious_top_n: int = 5
+    stage1_inherit_serious_eval_rows: int = 192
 
     # ===== reproducibility =====
     seed: int = 3407
+    candidate_train_seeds: Tuple[int, ...] = (3407, 1337, 2029)
 
     # ===== training =====
     use_bf16: bool = True
@@ -151,7 +152,8 @@ class CFG:
     stage1_epochs: float = 0.8
     stage2_epochs: float = 3.0
     stage2_rounds: int = 6
-    stage1_max_prompt_chars: int = 900
+    stage1_max_prompt_chars: int = 1800
+    stage1_relaxed_max_prompt_chars: int = 2200
     stage1_lr: float = 1.2e-4
     stage2_lr: float = 4e-5
 
@@ -160,8 +162,16 @@ class CFG:
     enable_prompt_template_ablation: bool = True
     enable_family_reweight: bool = True
     enable_length_bucket_bonus: bool = True
-    run_supervision_ablation: bool = True
+    run_supervision_ablation: bool = False
+
+    # ===== stage-specific supervision =====
+    stage1_supervision_variant: str = "answer_only"
+    stage2_supervision_variant: str = "family_aware_mix"
+    valid_supervision_variant: str = "family_aware_mix"
+
+    # 保留这个字段仅用于兼容旧代码 / ablation 打印，不再作为主训练选择开关
     primary_supervision_variant: str = "family_aware_mix"
+
     supervision_ablation_variants: Tuple[str, ...] = ("answer_only", "short_reasoning", "family_aware_mix")
     supervision_ablation_stage1_epochs: float = 0.15
     supervision_ablation_stage2_epochs: float = 0.25
@@ -176,15 +186,17 @@ class CFG:
         "T4_numeric_specialized",
         "T5_text_specialized",
     )
-    template_router_top_k: int = 4
+    template_router_top_k: int = 5
     test_time_router_top_k: int = 4
+    train_time_use_template_augmentation: bool = True
+    train_time_template_top_k: int = 3
     fallback_template_id: str = "T2_compact"
     pseudolabel_min_confidence: float = 0.90
     pseudolabel_source_loss_weight: float = 0.4
     hard_mining_bottom_family_k: int = 5
     hard_mining_bottom_answer_type_k: int = 3
     hard_mining_bottom_bucket_k: int = 3
-    template_ablation_after_stage1_rows: int = 128
+    template_ablation_after_stage1_rows: int = 192
     template_ablation_stage2_min_gain: float = 0.02
     template_ablation_family_min_rows: int = 10
     template_ablation_require_non_worse_boxed_metrics: bool = True
@@ -193,17 +205,19 @@ class CFG:
     template_ablation_strong_family_accuracy: float = 0.85
     template_ablation_strong_family_min_gain: float = 0.04
     stage2_asset_refresh_interval_rounds: int = 2
-    stage2_refresh_template_eval_rows: int = 96
+    stage2_refresh_template_eval_rows: int = 128
     stage2_refresh_weak_family_top_k: int = 3
     stage2_refresh_min_weak_family_gain: float = 0.005
-    stage2_refresh_replay_family_error_threshold: float = 0.40
+    stage2_refresh_replay_family_error_threshold: float = 0.33
     fixed_sanity_rows: int = 64
-    stage1_family_frequency_quantile: float = 0.55
-    hard_mining_family_boost: float = 0.50
+    stage1_family_frequency_quantile: float = 0.45
+    stage1_open_template_extra_ratio: float = 0.08
+    stage1_multi_token_extra_ratio: float = 0.04
+    hard_mining_family_boost: float = 0.35
     hard_mining_template_group_boost: float = 0.28
     hard_mining_answer_type_boost: float = 0.25
     hard_mining_bucket_boost: float = 0.20
-    hard_mining_sample_boost: float = 0.80
+    hard_mining_sample_boost: float = 0.55
     replay_probe_rows: int = 128
     short_text_weight_boost: float = 1.25
     open_template_short_text_extra_boost: float = 1.10
@@ -211,7 +225,7 @@ class CFG:
 
     # ===== runtime control =====
     run_stage1_multi_seed_eval: bool = False
-    run_stage1_submission_style_eval: bool = False
+    run_stage1_submission_style_eval: bool = True
     run_post_train_heavy_eval: bool = False
     save_stage1_snapshot: bool = True
     save_final_snapshot_before_post_eval: bool = True
@@ -248,12 +262,15 @@ class CFG:
         "T4_numeric_specialized",
     )
 
+# ===== 手动切换当前训练 seed：每次只改这里，然后 Run All =====
+TRAIN_SEED = 3407   # 想试别的 seed，就改这里：3407 / 1337 / 2029
+
 cfg = CFG()
-cfg.force_nemotron_torch_fallback = True
+cfg.seed = int(TRAIN_SEED)
+cfg.force_nemotron_torch_fallback = False
 
-cfg.run_tag = f"seed{cfg.seed}"
-
-cfg.work_dir = f"/kaggle/working/nemotron_advanced_{cfg.run_tag}"
+# ===== 最终输出仍然固定为官方要求的 submission.zip =====
+cfg.work_dir = "/kaggle/working/nemotron_advanced"
 cfg.output_dir = f"{cfg.work_dir}/checkpoints"
 cfg.adapter_dir = f"{cfg.work_dir}/adapter"
 cfg.topk_candidate_dir = f"{cfg.work_dir}/topk_candidates"
@@ -261,7 +278,11 @@ cfg.topk_candidate_manifest_path = f"{cfg.work_dir}/topk_candidates_manifest.csv
 cfg.final_rerank_report_path = f"{cfg.work_dir}/final_rerank_report.csv"
 cfg.final_export_info_path = f"{cfg.work_dir}/final_export_info.json"
 cfg.snapshot_root_dir = f"{cfg.work_dir}/snapshots"
-cfg.submission_zip = f"/kaggle/working/submission_{cfg.run_tag}.zip"
+cfg.submission_zip = "/kaggle/working/submission.zip"
+
+print(f"TRAIN SEED = {cfg.seed}")
+print(f"WORK DIR = {cfg.work_dir}")
+print(f"SUBMISSION ZIP = {cfg.submission_zip}")
 
 if cfg.smoke_test_mode:
     print(f"SMOKE TEST MODE ENABLED: profile={cfg.smoke_profile}")
@@ -330,6 +351,17 @@ def seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
+
+    try:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    except Exception:
+        pass
+
+    try:
+        torch.use_deterministic_algorithms(False)
+    except Exception:
+        pass
 
 seed_everything(cfg.seed)
 
@@ -1114,6 +1146,16 @@ def router_get_templates(prompt_family: str, answer_type: Optional[str] = None, 
     return deduped[: max(1, keep)]
 
 
+def choose_train_template_ids(answer_type: str, prompt_family: str) -> List[str]:
+    if not cfg.train_time_use_template_augmentation:
+        return [choose_template_id(answer_type, prompt_family)]
+
+    return router_get_templates(
+        prompt_family,
+        answer_type=answer_type,
+        top_k=cfg.train_time_template_top_k,
+    )
+
 def get_weak_families_from_pred_df(pred_df: pd.DataFrame, top_k: Optional[int] = None) -> List[str]:
     if pred_df is None or pred_df.empty:
         return []
@@ -1154,10 +1196,25 @@ def build_short_reasoning_scaffold(answer: Any, answer_type: str, prompt_family:
 
 # %%
 
-def build_training_record(row: pd.Series) -> Dict[str, Any]:
-    template_id, prompt_text = choose_template(row.prompt, row.answer_type, row.prompt_family)
+def build_training_record(
+    row: pd.Series,
+    template_id_override: Optional[str] = None,
+) -> Dict[str, Any]:
+    if template_id_override is None:
+        template_id = choose_template_id(row.answer_type, row.prompt_family)
+        record_id = row.id
+    else:
+        template_id = template_id_override
+        record_id = f"{row.id}__{template_id}"
+
+    prompt_text = TEMPLATE_POOL[template_id](row.prompt)
     answer_text = boxed(row.answer)
-    short_reasoning_text = build_short_reasoning_scaffold(row.answer, row.answer_type, row.prompt_family)
+    short_reasoning_text = build_short_reasoning_scaffold(
+        row.answer,
+        row.answer_type,
+        row.prompt_family,
+    )
+
     full_text = prompt_text + answer_text
     reasoning_full_text = prompt_text + short_reasoning_text
 
@@ -1168,7 +1225,8 @@ def build_training_record(row: pd.Series) -> Dict[str, Any]:
     difficulty += 0.2 if row.prompt_family == "open_template" else 0.0
 
     return {
-        "id": row.id,
+        "id": record_id,
+        "source_example_id": row.id,
         "prompt_family": row.prompt_family,
         "template_group": row.template_group,
         "answer_type": row.answer_type,
@@ -1187,11 +1245,15 @@ def build_training_record(row: pd.Series) -> Dict[str, Any]:
     }
 
 
-def build_records_frame(df: pd.DataFrame) -> pd.DataFrame:
+def build_records_frame(
+    df: pd.DataFrame,
+    augment_templates: bool = False,
+) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(
             columns=[
                 "id",
+                "source_example_id",
                 "prompt_family",
                 "template_group",
                 "answer_type",
@@ -1209,31 +1271,108 @@ def build_records_frame(df: pd.DataFrame) -> pd.DataFrame:
                 "len_bucket",
             ]
         )
-    return df.apply(build_training_record, axis=1, result_type="expand")
+
+    records: List[Dict[str, Any]] = []
+
+    for _, row in df.iterrows():
+        if augment_templates:
+            template_ids = choose_train_template_ids(
+                row.answer_type,
+                row.prompt_family,
+            )
+            for template_id in template_ids:
+                records.append(
+                    build_training_record(
+                        row,
+                        template_id_override=template_id,
+                    )
+                )
+        else:
+            records.append(build_training_record(row))
+
+    return pd.DataFrame(records)
 
 
 def split_stage_records(records_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, set]:
     family_freq = records_df["prompt_family"].value_counts(normalize=True)
     stable_families = set(
-        family_freq[family_freq >= family_freq.quantile(cfg.stage1_family_frequency_quantile)].index.tolist()
+        family_freq[
+            family_freq >= family_freq.quantile(cfg.stage1_family_frequency_quantile)
+        ].index.tolist()
     )
-    stage1_mask = (
+
+    base_stage1_mask = (
         records_df["prompt_chars"].le(cfg.stage1_max_prompt_chars)
         & records_df["prompt_family"].isin(stable_families)
         & records_df["answer_type"].isin(["numeric", "binary", "short_text"])
     )
-    stage1_records_local = records_df.loc[stage1_mask].reset_index(drop=True)
+
+    stage1_base = records_df.loc[base_stage1_mask].copy()
+    residual = records_df.loc[~base_stage1_mask].copy()
+
+    extra_open_pool = residual.loc[
+        residual["prompt_chars"].le(cfg.stage1_relaxed_max_prompt_chars)
+        & residual["prompt_family"].isin(stable_families)
+        & residual["prompt_family"].eq("open_template")
+        & residual["answer_type"].isin(["numeric", "short_text"])
+    ].copy()
+
+    extra_multi_pool = residual.loc[
+        residual["prompt_chars"].le(cfg.stage1_relaxed_max_prompt_chars)
+        & residual["prompt_family"].isin(stable_families)
+        & residual["answer_type"].eq("multi_token_text")
+        & residual["prompt_family"].ne("cipher_decrypt")
+    ].copy()
+
+    extra_open_n = min(
+        len(extra_open_pool),
+        int(round(len(stage1_base) * cfg.stage1_open_template_extra_ratio)),
+    )
+    extra_multi_n = min(
+        len(extra_multi_pool),
+        int(round(len(stage1_base) * cfg.stage1_multi_token_extra_ratio)),
+    )
+
+    extra_frames = []
+    if extra_open_n > 0:
+        extra_frames.append(
+            extra_open_pool.sample(n=extra_open_n, random_state=cfg.seed)
+        )
+    if extra_multi_n > 0:
+        extra_frames.append(
+            extra_multi_pool.sample(n=extra_multi_n, random_state=cfg.seed + 1)
+        )
+
+    if extra_frames:
+        stage1_records_local = pd.concat(
+            [stage1_base] + extra_frames,
+            ignore_index=True,
+        )
+        stage1_records_local = (
+            stage1_records_local
+            .drop_duplicates(subset=["id"])
+            .reset_index(drop=True)
+        )
+    else:
+        stage1_records_local = stage1_base.reset_index(drop=True)
+
     stage2_records_local = records_df.reset_index(drop=True)
     return stage1_records_local, stage2_records_local, stable_families
 
 
-train_records = build_records_frame(train_fold)
-valid_records = build_records_frame(valid_fold)
+train_records = build_records_frame(
+    train_fold,
+    augment_templates=cfg.train_time_use_template_augmentation,
+)
+valid_records = build_records_frame(
+    valid_fold,
+    augment_templates=False,
+)
+
 stage1_records, stage2_records, stable_families = split_stage_records(train_records)
 
 print(train_records.shape, valid_records.shape)
 display(train_records.head(2))
-
 
 # %% [markdown]
 # ## Cell 10 — Stage 1 / Stage 2 curriculum 切分
@@ -1244,7 +1383,21 @@ display(train_records.head(2))
 
 # %%
 print("stage1 records:", stage1_records.shape)
+print(
+    "stage1 unique source examples:",
+    stage1_records["source_example_id"].nunique()
+    if "source_example_id" in stage1_records.columns
+    else stage1_records["id"].nunique(),
+)
+
 print("stage2 records:", stage2_records.shape)
+print(
+    "stage2 unique source examples:",
+    stage2_records["source_example_id"].nunique()
+    if "source_example_id" in stage2_records.columns
+    else stage2_records["id"].nunique(),
+)
+
 print("stable families used in stage1:", sorted(stable_families)[:20])
 
 
@@ -1337,16 +1490,10 @@ def make_supervision_frame(df: pd.DataFrame, supervision_variant: str) -> pd.Dat
     tmp = df.copy()
 
     if supervision_variant == "family_aware_mix":
+        # 只让真正偏结构推理、且答案不是 text 的样本继续走 short_reasoning
         use_short_reasoning = (
-            tmp["prompt_family"].isin({"matrix_reasoning", "sequence", "fewshot_pattern"})
+            tmp["prompt_family"].isin({"matrix_reasoning"})
             & tmp["answer_type"].isin({"numeric", "binary"})
-        )
-
-        # 对较长的 open_template 数值题，也给一点轻量 reasoning scaffold
-        use_short_reasoning |= (
-            tmp["prompt_family"].eq("open_template")
-            & tmp["answer_type"].eq("numeric")
-            & tmp["prompt_chars"].ge(600)
         )
 
         tmp["supervision_variant"] = np.where(
@@ -1439,9 +1586,13 @@ stage1_variant_ds, stage2_variant_ds, valid_variant_ds = refresh_variant_dataset
     valid_records,
 )
 
-stage1_ds = stage1_variant_ds[cfg.primary_supervision_variant]
-stage2_ds = stage2_variant_ds[cfg.primary_supervision_variant]
-valid_ds = valid_variant_ds[cfg.primary_supervision_variant]
+stage1_ds = stage1_variant_ds[cfg.stage1_supervision_variant]
+stage2_ds = stage2_variant_ds[cfg.stage2_supervision_variant]
+valid_ds = valid_variant_ds[cfg.valid_supervision_variant]
+
+print("stage1 supervision variant:", cfg.stage1_supervision_variant)
+print("stage2 supervision variant:", cfg.stage2_supervision_variant)
+print("valid supervision variant :", cfg.valid_supervision_variant)
 
 print(stage2_ds[0].keys())
 print("non-masked labels:", sum(x != -100 for x in stage2_ds[0]["labels"]))
@@ -3012,7 +3163,11 @@ class LocalAccuracyCallback(TrainerCallback):
             router_top_k=self.router_top_k,
             max_new_tokens_grid=self.max_new_tokens_grid,
         )
-        record = {"step": int(state.global_step), "local_accuracy": float(acc)}
+        record = {
+            "step": int(state.global_step),
+            "local_accuracy": float(acc),
+        }
+
         self.history.append(record)
 
         pd.DataFrame(self.history).to_csv(self.save_path, index=False)
@@ -3150,16 +3305,36 @@ def refresh_stage2_training_assets(
     current_model: Optional[torch.nn.Module] = None,
     unlabeled_df: Optional[pd.DataFrame] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Dataset], Dict[str, Dataset], Dataset, Dataset, np.ndarray, pd.DataFrame]:
-    refreshed_train_records = build_records_frame(train_fold_df)
-    refreshed_valid_records = build_records_frame(valid_fold_df)
+    refreshed_train_records = build_records_frame(
+        train_fold_df,
+        augment_templates=cfg.train_time_use_template_augmentation,
+    )
+    refreshed_valid_records = build_records_frame(
+        valid_fold_df,
+        augment_templates=False,
+    )
     _stage1_records_ref, stage2_records_ref, _ = split_stage_records(refreshed_train_records)
     stage2_records_ref = maybe_extend_stage2_with_pseudolabels(current_model, stage2_records_ref, unlabeled_df if unlabeled_df is not None else pd.DataFrame()) if current_model is not None else stage2_records_ref
-    _, stage2_variant_ref, valid_variant_ref = refresh_variant_datasets(stage1_records_df, stage2_records_ref, refreshed_valid_records)
-    stage2_ds_ref = stage2_variant_ref[cfg.primary_supervision_variant]
-    valid_ds_ref = valid_variant_ref[cfg.primary_supervision_variant]
-    stage2_weights_ref = compute_sample_weights(stage2_records_ref)
-    return refreshed_train_records, refreshed_valid_records, stage2_variant_ref, valid_variant_ref, stage2_ds_ref, valid_ds_ref, stage2_weights_ref, stage2_records_ref
+    _, stage2_variant_ref, valid_variant_ref = refresh_variant_datasets(
+        stage1_records_df,
+        stage2_records_ref,
+        refreshed_valid_records,
+    )
 
+    stage2_ds_ref = stage2_variant_ref[cfg.stage2_supervision_variant]
+    valid_ds_ref = valid_variant_ref[cfg.valid_supervision_variant]
+
+    stage2_weights_ref = compute_sample_weights(stage2_records_ref)
+    return (
+        refreshed_train_records,
+        refreshed_valid_records,
+        stage2_variant_ref,
+        valid_variant_ref,
+        stage2_ds_ref,
+        valid_ds_ref,
+        stage2_weights_ref,
+        stage2_records_ref,
+    )
 
 def perform_conservative_template_refresh(
     model: torch.nn.Module,
@@ -3412,7 +3587,10 @@ for variant, ds in stage2_variant_ds.items():
 variant_panel_df = build_supervision_variant_panel(stage2_records.head(min(len(stage2_records), 256)))
 display(variant_panel_df)
 variant_panel_df.to_csv(Path(cfg.work_dir) / "supervision_variant_panel.csv", index=False)
-print("current primary supervision variant:", cfg.primary_supervision_variant)
+print("stage1 supervision variant:", cfg.stage1_supervision_variant)
+print("stage2 supervision variant:", cfg.stage2_supervision_variant)
+print("valid supervision variant :", cfg.valid_supervision_variant)
+print("legacy primary supervision variant (compat only):", cfg.primary_supervision_variant)
 print("initial family template priors:")
 display(pd.DataFrame(sorted(BEST_TEMPLATE_BY_FAMILY.items()), columns=["prompt_family", "template_id"]))
 
@@ -3661,7 +3839,7 @@ local_callback = LocalAccuracyCallback(
     metric_name="local_accuracy",
     min_global_step=cfg.topk_min_global_step,
     router_top_k=cfg.test_time_router_top_k,
-    max_new_tokens_grid=(64, 96),
+    max_new_tokens_grid=(64, 96, 128),
 )
 if len(stage1_ds) > 0:
     trainer_stage1 = WeightedTrainer(
@@ -3850,8 +4028,8 @@ def refresh_stage2_assets_for_round(current_model: torch.nn.Module, completed_ro
     )
     return {
         "train_records_df": refreshed_stage2_records,
-        "train_dataset": refreshed_stage2_ds,
-        "eval_dataset": refreshed_valid_ds,
+        "train_dataset": refreshed_stage2_variant_ds[cfg.stage2_supervision_variant],
+        "eval_dataset": refreshed_valid_variant_ds[cfg.valid_supervision_variant],
         "valid_records_df": refreshed_valid_records,
         "sample_weights": refreshed_stage2_weights,
     }
@@ -4459,6 +4637,18 @@ else:
         model.save_pretrained(final_adapter_dir)
         tokenizer.save_pretrained(final_adapter_dir)
 
+        fallback_info = {
+            "candidate_dir": str(final_adapter_dir),
+            "local_accuracy": None,
+            "step": None,
+            "selection_mode": "fallback_current_in_memory_model",
+        }
+
+        Path(cfg.final_export_info_path).write_text(
+            json.dumps(fallback_info, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
 adapter_cfg_path = final_adapter_dir / "adapter_config.json"
 assert adapter_cfg_path.exists(), "缺少 adapter_config.json，无法提交"
 
@@ -4483,7 +4673,7 @@ else:
             serious_eval_df,
             extractor_fn=metric_extract_prediction,
             router_top_k=cfg.test_time_router_top_k,
-            max_new_tokens_grid=(64, 96),
+            max_new_tokens_grid=(64, 96, 128),
         )
 
         print(f"[final exported adapter proxy accuracy] {final_export_proxy_acc:.4f}")
