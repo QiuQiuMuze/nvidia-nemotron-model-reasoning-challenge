@@ -92,6 +92,10 @@ class CFG:
     adapter_dir: str = "/kaggle/working/nemotron_advanced/adapter"
     submission_zip: str = "/kaggle/working/submission.zip"
 
+    # ===== per-round submission export =====
+    round_submission_dir: str = "/kaggle/working/nemotron_advanced/round_submissions"
+    save_stage2_round_submissions: bool = True
+
     # ===== candidate / final selection =====
     topk_candidate_keep: int = 5
     topk_candidate_dir: str = "/kaggle/working/nemotron_advanced/topk_candidates"
@@ -140,7 +144,7 @@ class CFG:
 
     # ===== curriculum =====
     stage1_epochs: float = 0.6
-    stage2_epochs: float = 1.2
+    stage2_epochs: float = 2.1
     stage2_rounds: int = 3
     stage1_max_prompt_chars: int = 900
     stage1_lr: float = 1.6e-4
@@ -183,18 +187,18 @@ class CFG:
     template_ablation_secondary_max_drop: float = 0.01
     template_ablation_strong_family_accuracy: float = 0.85
     template_ablation_strong_family_min_gain: float = 0.04
-    stage2_asset_refresh_interval_rounds: int = 2
+    stage2_asset_refresh_interval_rounds: int = 1
     stage2_refresh_template_eval_rows: int = 96
     stage2_refresh_weak_family_top_k: int = 3
     stage2_refresh_min_weak_family_gain: float = 0.005
     stage2_refresh_replay_family_error_threshold: float = 0.40
     fixed_sanity_rows: int = 64
     stage1_family_frequency_quantile: float = 0.55
-    hard_mining_family_boost: float = 0.35
+    hard_mining_family_boost: float = 0.50
     hard_mining_template_group_boost: float = 0.20
     hard_mining_answer_type_boost: float = 0.20
     hard_mining_bucket_boost: float = 0.15
-    hard_mining_sample_boost: float = 0.60
+    hard_mining_sample_boost: float = 0.90
     replay_probe_rows: int = 128
     short_text_weight_boost: float = 1.25
     open_template_short_text_extra_boost: float = 1.10
@@ -209,7 +213,7 @@ class CFG:
     post_eval_fail_open: bool = True
 
     # ===== smoke test mode =====
-    smoke_test_mode: bool = True
+    smoke_test_mode: bool = False
     smoke_train_rows: int = 24
     smoke_valid_rows: int = 12
     smoke_fast_eval_rows: int = 8
@@ -295,6 +299,7 @@ Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
 Path(cfg.adapter_dir).mkdir(parents=True, exist_ok=True)
 Path(cfg.topk_candidate_dir).mkdir(parents=True, exist_ok=True)
 Path(cfg.snapshot_root_dir).mkdir(parents=True, exist_ok=True)
+Path(cfg.round_submission_dir).mkdir(parents=True, exist_ok=True)
 
 assert cfg.lora_r <= cfg.max_lora_rank, "LoRA rank 超过比赛上限 32"
 assert cfg.max_seq_len <= cfg.official_max_model_len, "训练 max_seq_len 超过官方 max_model_len"
@@ -3162,7 +3167,14 @@ def train_stage2_with_reweight(
             prefix=f"stage2_round_{round_idx + 1}",
         )
 
+        if cfg.save_stage2_round_submissions:
+            export_current_model_as_round_submission(
+                model=model,
+                round_idx=round_idx + 1,
+            )
+
         hard_profile = build_hard_profile(last_pred_df)
+
         CURRENT_WEAK_FAMILIES[:] = get_weak_families_from_pred_df(last_pred_df, top_k=cfg.stage2_refresh_weak_family_top_k)
         probe_acc, replay_probe_pred_df = evaluate_accuracy(model, train_replay_probe_df, extractor_fn=fast_extract_prediction)
         replay_probe_pred_df.to_csv(Path(cfg.work_dir) / f"stage2_round_{round_idx + 1}_train_probe_predictions.csv", index=False)
@@ -3506,6 +3518,54 @@ stage2_weights = compute_sample_weights(
     replay_buffer=replay_buffer,
 )
 print("stage2 weight summary after hard profile + replay bootstrap:", np.quantile(stage2_weights, [0, 0.25, 0.5, 0.75, 1]))
+
+# Cell 20.5
+def export_current_model_as_round_submission(
+    model: torch.nn.Module,
+    round_idx: int,
+) -> Path:
+    """
+    把当前内存中的 model 导出成一个可提交 zip：
+    /kaggle/working/nemotron_advanced/round_submissions/{round_idx}.zip
+    """
+    round_idx = int(round_idx)
+    round_root = Path(cfg.round_submission_dir)
+    round_root.mkdir(parents=True, exist_ok=True)
+
+    tmp_adapter_dir = round_root / f"round_{round_idx}_adapter"
+    zip_path = round_root / f"{round_idx}.zip"
+
+    if tmp_adapter_dir.exists():
+        shutil.rmtree(tmp_adapter_dir, ignore_errors=True)
+    tmp_adapter_dir.mkdir(parents=True, exist_ok=True)
+
+    if zip_path.exists():
+        zip_path.unlink()
+
+    # 先导出当前 round 结束时的 adapter
+    model.save_pretrained(tmp_adapter_dir)
+
+    allowed_submit_files = {
+        "adapter_config.json",
+        "adapter_model.safetensors",
+        "adapter_model.bin",
+    }
+
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        found = set()
+        for path in sorted(tmp_adapter_dir.iterdir()):
+            if path.is_file() and path.name in allowed_submit_files:
+                zf.write(path, arcname=path.name)
+                found.add(path.name)
+
+    assert "adapter_config.json" in found, f"{zip_path.name} 缺少 adapter_config.json"
+    assert ("adapter_model.safetensors" in found) or ("adapter_model.bin" in found), f"{zip_path.name} 缺少 adapter 权重文件"
+
+    print(f"[round-export] saved round {round_idx} zip -> {zip_path}")
+    print(f"[round-export] packed files -> {sorted(found)}")
+    print(f"[round-export] zip size (MB) -> {round(zip_path.stat().st_size / 1024 / 1024, 3)}")
+
+    return zip_path
 
 # %% [markdown]
 # ## Cell 21 — Stage 2 训练（多轮重加权，而非轮间重建数据资产）
