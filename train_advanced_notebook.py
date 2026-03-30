@@ -261,6 +261,10 @@ class CFG:
         numeric_rel_tol: float = 1e-2
         prefer_official_metric_backend: bool = True
         official_metric_backend_path: Optional[str] = None
+        # 更贴近线上评测：不走模板路由，直接 raw prompt + 官方提取器
+        online_like_eval_enabled: bool = True
+        online_like_require_official_metric: bool = True
+        online_like_max_new_tokens: int = 7680
 
         # ===== curriculum =====
         stage1_epochs: float = 0.9
@@ -2765,6 +2769,43 @@ class CFG:
 
 
     @torch.no_grad()
+    def online_like_predict_row(
+            model: torch.nn.Module,
+            row: Any,
+            max_new_tokens: Optional[int] = None,
+            extractor_fn=metric_extract_prediction,
+    ) -> Dict[str, Any]:
+        prompt_text = row.prompt if hasattr(row, "prompt") else row["prompt"]
+        raw = generate_answer_text(
+            model,
+            prompt_text,
+            max_new_tokens=max_new_tokens or cfg.online_like_max_new_tokens,
+        ).strip()
+        boxed_ans = extract_boxed(raw)
+        pred = extractor_fn(raw)
+        return {
+            "pred": pred,
+            "consensus_votes": 1,
+            "num_templates": 1,
+            "decision_type": "online_like_raw_prompt",
+            "fallback_used": False,
+            "template_ids": ["RAW_PROMPT"],
+            "candidates": [
+                {
+                    "template_id": "RAW_PROMPT",
+                    "raw": raw,
+                    "answer": pred,
+                    "boxed_answer": boxed_ans,
+                    "has_boxed": boxed_ans is not None,
+                }
+            ],
+            "prompt_family": infer_prompt_family(prompt_text),
+            "answer_type": infer_expected_answer_type_from_prompt(prompt_text),
+            "gold": canonicalize_answer(getattr(row, "answer", "")),
+        }
+
+
+    @torch.no_grad()
     def evaluate_with_consensus(
             model: torch.nn.Module,
             df: pd.DataFrame,
@@ -2797,19 +2838,32 @@ class CFG:
             model: torch.nn.Module,
             valid_df: pd.DataFrame,
             top_k: Optional[int] = None,
+            online_like: bool = False,
     ) -> Tuple[float, pd.DataFrame]:
         rows = []
+        if online_like and cfg.online_like_require_official_metric and OFFICIAL_METRIC_BACKEND is None:
+            raise RuntimeError(
+                "online_like_eval 需要官方 evaluation.py/metric.py 后端，但当前未加载成功。"
+            )
         for row in valid_df.itertuples(index=False):
-            routed_templates = router_get_templates(
-                infer_prompt_family(row.prompt),
-                answer_type=infer_expected_answer_type_from_prompt(row.prompt),
-                top_k=top_k,
-            )
-            result = predict_one_row(
-                model,
-                row,
-                template_ids=routed_templates,
-            )
+            if online_like:
+                result = online_like_predict_row(
+                    model,
+                    row,
+                    max_new_tokens=cfg.online_like_max_new_tokens,
+                    extractor_fn=metric_extract_prediction,
+                )
+            else:
+                routed_templates = router_get_templates(
+                    infer_prompt_family(row.prompt),
+                    answer_type=infer_expected_answer_type_from_prompt(row.prompt),
+                    top_k=top_k,
+                )
+                result = predict_one_row(
+                    model,
+                    row,
+                    template_ids=routed_templates,
+                )
             gold = canonicalize_answer(row.answer)
             rows.append(
                 {
@@ -3804,6 +3858,7 @@ class CFG:
             model,
             serious_eval_df.head(min(len(serious_eval_df), 128)),
             top_k=cfg.test_time_router_top_k,
+            online_like=cfg.online_like_eval_enabled,
         )
         print(f"stage1 submission-style accuracy: {stage1_submission_style_acc:.4f}")
         stage1_submission_style_df.to_csv(Path(cfg.work_dir) / "stage1_submission_style_eval.csv", index=False)
@@ -4002,6 +4057,7 @@ class CFG:
                 model,
                 serious_eval_df.head(min(len(serious_eval_df), 128)),
                 top_k=cfg.test_time_router_top_k,
+                online_like=cfg.online_like_eval_enabled,
             ),
             fail_open=cfg.post_eval_fail_open,
         )
@@ -4327,6 +4383,7 @@ class CFG:
                         candidate_model,
                         rerank_submission_df,
                         top_k=cfg.test_time_router_top_k,
+                        online_like=cfg.online_like_eval_enabled,
                     )
                 else:
                     submission_style_acc = float("nan")
@@ -4735,6 +4792,10 @@ class CFG:
     numeric_rel_tol: float = 1e-2
     prefer_official_metric_backend: bool = True
     official_metric_backend_path: Optional[str] = None
+    # 更贴近线上评测：不走模板路由，直接 raw prompt + 官方提取器
+    online_like_eval_enabled: bool = True
+    online_like_require_official_metric: bool = True
+    online_like_max_new_tokens: int = 7680
 
     # ===== curriculum =====
     stage1_epochs: float = 0.9
@@ -7267,23 +7328,73 @@ def evaluate_with_consensus(
 
 
 @torch.no_grad()
+def online_like_predict_row(
+    model: torch.nn.Module,
+    row: Any,
+    max_new_tokens: Optional[int] = None,
+    extractor_fn=metric_extract_prediction,
+) -> Dict[str, Any]:
+    prompt_text = row.prompt if hasattr(row, "prompt") else row["prompt"]
+    raw = generate_answer_text(
+        model,
+        prompt_text,
+        max_new_tokens=max_new_tokens or cfg.online_like_max_new_tokens,
+    ).strip()
+    boxed_ans = extract_boxed(raw)
+    pred = extractor_fn(raw)
+    return {
+        "pred": pred,
+        "consensus_votes": 1,
+        "num_templates": 1,
+        "decision_type": "online_like_raw_prompt",
+        "fallback_used": False,
+        "template_ids": ["RAW_PROMPT"],
+        "candidates": [
+            {
+                "template_id": "RAW_PROMPT",
+                "raw": raw,
+                "answer": pred,
+                "boxed_answer": boxed_ans,
+                "has_boxed": boxed_ans is not None,
+            }
+        ],
+        "prompt_family": infer_prompt_family(prompt_text),
+        "answer_type": infer_expected_answer_type_from_prompt(prompt_text),
+        "gold": canonicalize_answer(getattr(row, "answer", "")),
+    }
+
+
+@torch.no_grad()
 def offline_submission_style_eval(
     model: torch.nn.Module,
     valid_df: pd.DataFrame,
     top_k: Optional[int] = None,
+    online_like: bool = False,
 ) -> Tuple[float, pd.DataFrame]:
     rows = []
+    if online_like and cfg.online_like_require_official_metric and OFFICIAL_METRIC_BACKEND is None:
+        raise RuntimeError(
+            "online_like_eval 需要官方 evaluation.py/metric.py 后端，但当前未加载成功。"
+        )
     for row in valid_df.itertuples(index=False):
-        routed_templates = router_get_templates(
-            infer_prompt_family(row.prompt),
-            answer_type=infer_expected_answer_type_from_prompt(row.prompt),
-            top_k=top_k,
-        )
-        result = predict_one_row(
-            model,
-            row,
-            template_ids=routed_templates,
-        )
+        if online_like:
+            result = online_like_predict_row(
+                model,
+                row,
+                max_new_tokens=cfg.online_like_max_new_tokens,
+                extractor_fn=metric_extract_prediction,
+            )
+        else:
+            routed_templates = router_get_templates(
+                infer_prompt_family(row.prompt),
+                answer_type=infer_expected_answer_type_from_prompt(row.prompt),
+                top_k=top_k,
+            )
+            result = predict_one_row(
+                model,
+                row,
+                template_ids=routed_templates,
+            )
         gold = canonicalize_answer(row.answer)
         rows.append(
             {
@@ -8278,6 +8389,7 @@ if cfg.run_stage1_submission_style_eval:
         model,
         serious_eval_df.head(min(len(serious_eval_df), 128)),
         top_k=cfg.test_time_router_top_k,
+        online_like=cfg.online_like_eval_enabled,
     )
     print(f"stage1 submission-style accuracy: {stage1_submission_style_acc:.4f}")
     stage1_submission_style_df.to_csv(Path(cfg.work_dir) / "stage1_submission_style_eval.csv", index=False)
@@ -8476,6 +8588,7 @@ if cfg.run_post_train_heavy_eval:
             model,
             serious_eval_df.head(min(len(serious_eval_df), 128)),
             top_k=cfg.test_time_router_top_k,
+            online_like=cfg.online_like_eval_enabled,
         ),
         fail_open=cfg.post_eval_fail_open,
     )
@@ -8801,6 +8914,7 @@ def rerank_topk_candidates(candidate_df: pd.DataFrame) -> pd.DataFrame:
                     candidate_model,
                     rerank_submission_df,
                     top_k=cfg.test_time_router_top_k,
+                    online_like=cfg.online_like_eval_enabled,
                 )
             else:
                 submission_style_acc = float("nan")
