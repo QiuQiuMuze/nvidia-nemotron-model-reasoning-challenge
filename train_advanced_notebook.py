@@ -128,7 +128,8 @@ class CFG:
     # ===== training =====
     use_bf16: bool = True
     use_4bit: bool = True
-    max_seq_len: int = 2048
+    # 在不显著增加训练成本的前提下，适度提高上下文覆盖。
+    max_seq_len: int = 3072
     micro_batch_size: int = 1
     eval_batch_size: int = 1
     grad_accum: int = 16
@@ -163,7 +164,7 @@ class CFG:
     stage1_epochs: float = 0.9
     stage2_epochs: float = 2.8
     stage2_rounds: int = 4
-    stage1_max_prompt_chars: int = 1200
+    stage1_max_prompt_chars: int = 1800
     stage1_lr: float = 1.6e-4
     stage2_lr: float = 9e-5
 
@@ -210,7 +211,7 @@ class CFG:
     stage2_refresh_min_weak_family_gain: float = 0.005
     stage2_refresh_replay_family_error_threshold: float = 0.40
     fixed_sanity_rows: int = 64
-    stage1_family_frequency_quantile: float = 0.35
+    stage1_family_frequency_quantile: float = 0.20
     hard_mining_family_boost: float = 0.50
     hard_mining_template_group_boost: float = 0.20
     hard_mining_answer_type_boost: float = 0.20
@@ -222,6 +223,14 @@ class CFG:
     multi_token_text_weight_boost: float = 1.15
     cipher_decrypt_family_weight_boost: float = 1.20
     allow_target_auto_discovery: bool = False
+
+    # ===== external data hygiene =====
+    external_prompt_min_chars: int = 80
+    external_prompt_max_chars: int = 6000
+    external_answer_min_chars: int = 1
+    external_answer_max_chars: int = 96
+    unlabeled_prompt_min_chars: int = 80
+    unlabeled_prompt_max_chars: int = 6000
 
     # ===== runtime control =====
     run_stage1_multi_seed_eval: bool = True
@@ -436,8 +445,8 @@ def filter_external_data(df: pd.DataFrame) -> pd.DataFrame:
     tmp = df.copy()
     tmp["prompt"] = tmp["prompt"].astype(str)
     tmp["answer"] = tmp["answer"].astype(str).str.strip()
-    tmp = tmp[tmp["prompt"].str.len().between(40, 12000)]
-    tmp = tmp[tmp["answer"].str.len().between(1, 160)]
+    tmp = tmp[tmp["prompt"].str.len().between(cfg.external_prompt_min_chars, cfg.external_prompt_max_chars)]
+    tmp = tmp[tmp["answer"].str.len().between(cfg.external_answer_min_chars, cfg.external_answer_max_chars)]
     tmp = tmp[tmp["prompt"].str.contains("->|example|Examples|Now|Solve|Task|Question", regex=True, na=False)]
     tmp = tmp[~tmp["answer"].str.contains("todo|unknown|n/a", case=False, na=False)]
     return tmp.reset_index(drop=True)
@@ -469,7 +478,7 @@ def filter_unlabeled_pool(df: pd.DataFrame) -> pd.DataFrame:
         return df
     tmp = df.copy()
     tmp["prompt"] = tmp["prompt"].astype(str)
-    tmp = tmp[tmp["prompt"].str.len().between(40, 12000)]
+    tmp = tmp[tmp["prompt"].str.len().between(cfg.unlabeled_prompt_min_chars, cfg.unlabeled_prompt_max_chars)]
     tmp = tmp[tmp["prompt"].str.contains("->|example|Examples|Now|Solve|Task|Question", regex=True, na=False)]
     return tmp.reset_index(drop=True)
 
