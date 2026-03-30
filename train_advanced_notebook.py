@@ -397,20 +397,31 @@ print("Found test files:")
 for p in all_test:
     print("  ", p)
 
-# 只保留同时存在 train.csv 和 test.csv 的目录
-candidate_roots = []
-for p in all_train:
-    root = p.parent
-    if (root / "test.csv").exists():
-        candidate_roots.append(root)
+# 优先使用明确指定的比赛目录，避免误读到其他 Dataset（例如 demo / extra 数据）
+preferred_root = Path(cfg.competition_path)
+preferred_train = preferred_root / "train.csv"
+preferred_test = preferred_root / "test.csv"
 
-if not candidate_roots:
-    raise FileNotFoundError("在 /kaggle/input 下没找到同时包含 train.csv 和 test.csv 的目录")
+if preferred_train.exists() and preferred_test.exists():
+    data_root = preferred_root
+    train_path = preferred_train
+    test_path = preferred_test
+else:
+    # 回退：只保留同时存在 train.csv 和 test.csv 的目录
+    candidate_roots = []
+    for p in all_train:
+        root = p.parent
+        if (root / "test.csv").exists():
+            candidate_roots.append(root)
 
-# 取第一个候选目录
-data_root = candidate_roots[0]
-train_path = data_root / "train.csv"
-test_path = data_root / "test.csv"
+    if not candidate_roots:
+        raise FileNotFoundError("在 /kaggle/input 下没找到同时包含 train.csv 和 test.csv 的目录")
+
+    # 若未命中 cfg.competition_path，则显式按路径排序，避免 rglob 顺序不稳定
+    candidate_roots = sorted(candidate_roots, key=lambda x: str(x))
+    data_root = candidate_roots[0]
+    train_path = data_root / "train.csv"
+    test_path = data_root / "test.csv"
 
 print("Using data root:", data_root)
 print("Using train:", train_path)
@@ -2908,6 +2919,39 @@ def submission_style_predict_row(
 
 
 @torch.no_grad()
+def official_single_pass_predict_row(
+    model: torch.nn.Module,
+    row: Any,
+    max_new_tokens: int = 768,
+    extractor_fn=metric_extract_prediction,
+) -> Dict[str, Any]:
+    """更贴近官方评测：单提示词、单次生成、单答案提取（无模板路由/投票）。"""
+    prompt_text = row.prompt if hasattr(row, "prompt") else row["prompt"]
+    answer_type = infer_expected_answer_type_from_prompt(prompt_text)
+    prompt = (
+        f"{prompt_text}\n\n"
+        "Please reason internally and output only the final answer in \\boxed{}."
+    )
+    raw = generate_answer_text(
+        model,
+        prompt,
+        max_new_tokens=max_new_tokens,
+    )
+    pred = extractor_fn(raw)
+    return {
+        "pred": pred,
+        "raw": raw,
+        "answer_type": answer_type,
+        "prompt_family": infer_prompt_family(prompt_text),
+        "template_ids": ["official_single_pass"],
+        "consensus_votes": 1,
+        "num_templates": 1,
+        "decision_type": "single_pass",
+        "fallback_used": False,
+    }
+
+
+@torch.no_grad()
 def evaluate_with_consensus(
     model: torch.nn.Module,
     df: pd.DataFrame,
@@ -2943,16 +2987,10 @@ def offline_submission_style_eval(
 ) -> Tuple[float, pd.DataFrame]:
     rows = []
     for row in valid_df.itertuples(index=False):
-        routed_templates = router_get_templates(
-            infer_prompt_family(row.prompt),
-            answer_type=infer_expected_answer_type_from_prompt(row.prompt),
-            top_k=top_k,
-        )
-        result = predict_one_row(
-            model,
-            row,
-            template_ids=routed_templates,
-        )
+        # submission-style 评估改为官方近似单路评测，避免本地分数被“多模板投票”抬高
+        # 保留 top_k 参数仅为了兼容旧调用签名
+        _ = top_k
+        result = official_single_pass_predict_row(model, row)
         gold = canonicalize_answer(row.answer)
         rows.append(
             {
