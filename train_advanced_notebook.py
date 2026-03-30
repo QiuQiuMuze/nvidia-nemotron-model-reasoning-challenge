@@ -89,6 +89,7 @@ class CFG:
     official_temperature: float = 0.0
     official_top_p: float = 1.0
     official_max_model_len: int = 8192
+    official_eval_mode: bool = True
     warmup_steps_override: Optional[int] = None
 
     # ===== paths =====
@@ -150,8 +151,11 @@ class CFG:
     fast_eval_examples: int = 96
     serious_eval_examples: int = 256
     serious_eval_seeds: Tuple[int, ...] = (11, 23, 47)
-    numeric_rel_tol: float = 1e-2
-    prefer_official_metric_backend: bool = True
+    # 官方文案仅说明“relative numerical tolerance”，未公开具体数值；
+    # 这里采用更严格容差，避免本地分数乐观偏高。
+    numeric_rel_tol: float = 1e-4
+    # 由于比赛方隐藏官方评测实现，本地一律使用“官方公开描述模拟器”，不再尝试动态加载官方 backend 文件。
+    prefer_official_metric_backend: bool = False
     official_metric_backend_path: Optional[str] = None
 
     # ===== curriculum =====
@@ -814,55 +818,33 @@ def official_like_extract_prediction(text: str) -> str:
     return canonicalize_answer(lines[-1] if lines else text)
 
 
+def strict_official_fallback_extract_prediction(text: str) -> str:
+    """
+    兜底实现尽量贴近官方公开描述：
+    1) 优先 boxed；
+    2) 再尝试 final-answer pattern；
+    3) 再尝试其余启发式；
+    4) 最后取最后一个 numeric；
+    若都失败则返回规范化后的全文。
+    """
+    for fn in (extract_boxed, extract_final_answer_pattern, extract_other_heuristics, extract_last_numeric):
+        result = fn(text)
+        if result is not None:
+            return result
+    return canonicalize_answer(text)
+
+
 def extract_prediction(text: str) -> str:
     return official_like_extract_prediction(text)
 
 
-def load_official_metric_backend() -> Optional[Any]:
-    if not cfg.prefer_official_metric_backend:
-        return None
-
-    candidate_paths: List[Path] = []
-    if cfg.official_metric_backend_path:
-        candidate_paths.append(Path(cfg.official_metric_backend_path))
-    candidate_paths.extend([
-        Path(cfg.competition_path) / "evaluation.py",
-        Path(cfg.competition_path) / "metric.py",
-        Path("evaluation.py"),
-        Path("metric.py"),
-    ])
-
-    for path in candidate_paths:
-        if not path.exists():
-            continue
-        spec = importlib.util.spec_from_file_location("nemotron_official_metric", path)
-        if spec is None or spec.loader is None:
-            continue
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        extract_fn = getattr(module, "extract_prediction", None) or getattr(module, "extract_answer", None)
-        score_fn = getattr(module, "score_prediction", None) or getattr(module, "score", None)
-        if extract_fn is not None:
-            print(f"loaded official metric backend from: {path}")
-            return {"path": str(path), "extract_fn": extract_fn, "score_fn": score_fn}
-    print("official metric backend not found; fallback to local official_like extractor")
-    return None
-
-
-OFFICIAL_METRIC_BACKEND = load_official_metric_backend()
-
-
 def metric_extract_prediction(text: str) -> str:
-    if OFFICIAL_METRIC_BACKEND is not None:
-        return canonicalize_answer(OFFICIAL_METRIC_BACKEND["extract_fn"](text))
-    return official_like_extract_prediction(text)
+    return strict_official_fallback_extract_prediction(text)
 
 
 def approx_equal(pred: str, gold: str, rel_tol: float = cfg.numeric_rel_tol) -> bool:
     pred_c = canonicalize_answer(pred)
     gold_c = canonicalize_answer(gold)
-    if OFFICIAL_METRIC_BACKEND is not None and OFFICIAL_METRIC_BACKEND.get("score_fn") is not None:
-        return bool(OFFICIAL_METRIC_BACKEND["score_fn"](pred_c, gold_c))
     if pred_c == gold_c:
         return True
 
@@ -895,6 +877,16 @@ SYSTEM_PROMPT = (
     "You are a careful reasoning model. Solve the task accurately. "
     "Return the final answer only, enclosed in \\boxed{} with no extra commentary."
 )
+OFFICIAL_EVAL_PROMPT_SUFFIX = (
+    "\n\nPlease reason carefully and put your final answer inside \\boxed{}."
+)
+
+
+def build_official_eval_prompt(problem: str) -> str:
+    """
+    官方评测近似提示：不依赖自定义模板池，直接在题目后附加 boxed 指令。
+    """
+    return f"{problem}{OFFICIAL_EVAL_PROMPT_SUFFIX}"
 
 
 def template_compact(problem: str) -> str:
@@ -2077,7 +2069,13 @@ print("train replay probe subset:", train_replay_probe_df.shape)
 
 
 @torch.no_grad()
-def generate_answer_text(model: torch.nn.Module, prompt: str, max_new_tokens: int = 96) -> str:
+def generate_answer_text(
+    model: torch.nn.Module,
+    prompt: str,
+    max_new_tokens: int = 96,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+) -> str:
     prev_training = model.training
     prev_use_cache = getattr(model.config, "use_cache", None)
 
@@ -2092,7 +2090,9 @@ def generate_answer_text(model: torch.nn.Module, prompt: str, max_new_tokens: in
         outputs = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
-            do_sample=False,
+            do_sample=bool(temperature and temperature > 0),
+            temperature=temperature,
+            top_p=top_p,
             pad_token_id=tokenizer.eos_token_id,
         )
 
@@ -2198,30 +2198,84 @@ def predict_one_row(
 
 
 @torch.no_grad()
+def predict_one_row_official(
+    model: torch.nn.Module,
+    row: Any,
+    max_new_tokens: Optional[int] = None,
+    extractor_fn=metric_extract_prediction,
+) -> Dict[str, Any]:
+    prompt_text = row.prompt if hasattr(row, "prompt") else row["prompt"]
+    prompt_family = infer_prompt_family(prompt_text)
+    answer_type = infer_expected_answer_type_from_prompt(prompt_text)
+    eval_prompt = build_official_eval_prompt(prompt_text)
+    raw = generate_answer_text(
+        model,
+        eval_prompt,
+        max_new_tokens=cfg.official_max_new_tokens if max_new_tokens is None else max_new_tokens,
+        temperature=cfg.official_temperature,
+        top_p=cfg.official_top_p,
+    ).strip()
+    pred = extractor_fn(raw)
+    boxed_answer = extract_boxed(raw)
+    return {
+        "pred": canonicalize_answer(pred),
+        "consensus_votes": 1,
+        "num_templates": 1,
+        "decision_type": "official_single_prompt",
+        "fallback_used": False,
+        "template_ids": ["OFFICIAL_SINGLE_PROMPT"],
+        "candidates": [
+            {
+                "template_id": "OFFICIAL_SINGLE_PROMPT",
+                "raw": raw[:1200],
+                "answer": canonicalize_answer(pred),
+                "has_boxed": "\\boxed{" in raw,
+                "boxed_answer": boxed_answer,
+            }
+        ],
+        "prompt_family": prompt_family,
+        "answer_type": answer_type,
+        "gold": canonicalize_answer(getattr(row, "answer", "")),
+    }
+
+
+@torch.no_grad()
 def evaluate_accuracy(
     model: torch.nn.Module,
     df: pd.DataFrame,
     template_override: Optional[str] = None,
     max_new_tokens_grid: Sequence[int] = (64, 96),
     extractor_fn=metric_extract_prediction,
+    use_official_eval_mode: Optional[bool] = None,
 ) -> Tuple[float, pd.DataFrame]:
+    if use_official_eval_mode is None:
+        use_official_eval_mode = cfg.official_eval_mode
+
     rows = []
     for row in df.itertuples(index=False):
         prompt_family = infer_prompt_family(row.prompt)
         answer_type = infer_expected_answer_type_from_prompt(row.prompt)
-        routed_templates = [template_override] if template_override is not None else router_get_templates(
-            prompt_family,
-            answer_type=answer_type,
-            top_k=1,
-        )
-        result = predict_one_row(
-            model,
-            row,
-            template_ids=routed_templates,
-            fallback_template_id=None if template_override is not None else cfg.fallback_template_id,
-            max_new_tokens_grid=max_new_tokens_grid,
-            extractor_fn=extractor_fn,
-        )
+        if use_official_eval_mode:
+            result = predict_one_row_official(
+                model,
+                row,
+                max_new_tokens=cfg.official_max_new_tokens,
+                extractor_fn=extractor_fn,
+            )
+        else:
+            routed_templates = [template_override] if template_override is not None else router_get_templates(
+                prompt_family,
+                answer_type=answer_type,
+                top_k=1,
+            )
+            result = predict_one_row(
+                model,
+                row,
+                template_ids=routed_templates,
+                fallback_template_id=None if template_override is not None else cfg.fallback_template_id,
+                max_new_tokens_grid=max_new_tokens_grid,
+                extractor_fn=extractor_fn,
+            )
         matched_candidate = next((c for c in result["candidates"] if c.get("answer") == result["pred"]), None)
         candidate_raw = matched_candidate["raw"] if matched_candidate is not None else (result["candidates"][0]["raw"] if result["candidates"] else "")
         boxed_hit = any(candidate.get("has_boxed", False) for candidate in result["candidates"])
@@ -2692,16 +2746,19 @@ def offline_submission_style_eval(
 ) -> Tuple[float, pd.DataFrame]:
     rows = []
     for row in valid_df.itertuples(index=False):
-        routed_templates = router_get_templates(
-            infer_prompt_family(row.prompt),
-            answer_type=infer_expected_answer_type_from_prompt(row.prompt),
-            top_k=top_k,
-        )
-        result = predict_one_row(
-            model,
-            row,
-            template_ids=routed_templates,
-        )
+        if cfg.official_eval_mode:
+            result = predict_one_row_official(model, row, max_new_tokens=cfg.official_max_new_tokens)
+        else:
+            routed_templates = router_get_templates(
+                infer_prompt_family(row.prompt),
+                answer_type=infer_expected_answer_type_from_prompt(row.prompt),
+                top_k=top_k,
+            )
+            result = predict_one_row(
+                model,
+                row,
+                template_ids=routed_templates,
+            )
         gold = canonicalize_answer(row.answer)
         rows.append(
             {
