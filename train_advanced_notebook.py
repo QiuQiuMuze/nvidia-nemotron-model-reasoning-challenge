@@ -128,8 +128,8 @@ class CFG:
     # ===== training =====
     use_bf16: bool = True
     use_4bit: bool = True
-    # 在不显著增加训练成本的前提下，适度提高上下文覆盖。
-    max_seq_len: int = 3072
+    # 与官方推理窗口对齐（若硬件允许）。
+    max_seq_len: int = 8192
     micro_batch_size: int = 1
     eval_batch_size: int = 1
     grad_accum: int = 16
@@ -139,7 +139,8 @@ class CFG:
     save_steps: int = 50
     eval_steps: int = 50
     max_grad_norm: float = 0.3
-    enable_gradient_checkpointing: bool = False
+    # 长上下文训练默认开启 checkpointing 以提升稳定性与显存可用性。
+    enable_gradient_checkpointing: bool = True
     force_nemotron_torch_fallback: bool = False
     cuda_load_headroom_gib: int = 6
 
@@ -165,8 +166,9 @@ class CFG:
     stage2_epochs: float = 2.8
     stage2_rounds: int = 4
     stage1_max_prompt_chars: int = 1800
-    stage1_lr: float = 1.6e-4
-    stage2_lr: float = 9e-5
+    # 长上下文下适度降低学习率，减少训练振荡。
+    stage1_lr: float = 1.2e-4
+    stage2_lr: float = 7e-5
 
     # ===== optional leaderboard tricks =====
     enable_external_mixture: bool = True
@@ -217,6 +219,11 @@ class CFG:
     hard_mining_answer_type_boost: float = 0.20
     hard_mining_bucket_boost: float = 0.15
     hard_mining_sample_boost: float = 0.35
+    use_log_replay_boost: bool = True
+    sample_weight_clip_min: float = 0.35
+    sample_weight_clip_max: float = 2.80
+    sample_weight_temperature: float = 0.80
+    stage1_low_freq_sample_ratio: float = 0.30
     replay_probe_rows: int = 128
     short_text_weight_boost: float = 1.25
     open_template_short_text_extra_boost: float = 1.10
@@ -1170,7 +1177,7 @@ def split_stage_records(records_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Data
     stable_families = set(
         family_freq[family_freq >= family_freq.quantile(cfg.stage1_family_frequency_quantile)].index.tolist()
     )
-    stage1_mask = (
+    stage1_primary_mask = (
             records_df["prompt_chars"].le(cfg.stage1_max_prompt_chars)
             & records_df["prompt_family"].isin(stable_families)
             & (
@@ -1182,7 +1189,22 @@ def split_stage_records(records_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Data
                     )
             )
     )
-    stage1_records_local = records_df.loc[stage1_mask].reset_index(drop=True)
+    stage1_primary = records_df.loc[stage1_primary_mask].copy()
+
+    # 兼容低频 family：按比例混入低频样本，避免 Stage1 完全忽略尾部分布。
+    stage1_low_freq = records_df.loc[
+        records_df["prompt_chars"].le(cfg.stage1_max_prompt_chars)
+        & ~records_df["prompt_family"].isin(stable_families)
+    ].copy()
+    if len(stage1_primary) > 0 and len(stage1_low_freq) > 0 and cfg.stage1_low_freq_sample_ratio > 0:
+        low_freq_take = int(max(1, round(len(stage1_primary) * cfg.stage1_low_freq_sample_ratio)))
+        low_freq_take = min(low_freq_take, len(stage1_low_freq))
+        stage1_low_freq = stage1_low_freq.sample(n=low_freq_take, random_state=cfg.seed)
+        stage1_records_local = pd.concat([stage1_primary, stage1_low_freq], ignore_index=True)
+    else:
+        stage1_records_local = stage1_primary
+
+    stage1_records_local = stage1_records_local.drop_duplicates(subset=["id"]).reset_index(drop=True)
     stage2_records_local = records_df.reset_index(drop=True)
     return stage1_records_local, stage2_records_local, stable_families
 
@@ -1965,10 +1987,18 @@ def compute_sample_weights(
             weight *= 1.0 + cfg.hard_mining_answer_type_boost * hard_profile["answer_type"].get(row.answer_type, 0.0)
             weight *= 1.0 + cfg.hard_mining_bucket_boost * hard_profile["len_bucket"].get(row.len_bucket, 0.0)
         if replay_buffer is not None:
-            weight *= 1.0 + cfg.hard_mining_sample_boost * replay_buffer.get(row.id, 0)
+            replay_hit = replay_buffer.get(row.id, 0)
+            if cfg.use_log_replay_boost:
+                replay_factor = math.log1p(float(replay_hit))
+            else:
+                replay_factor = float(replay_hit)
+            weight *= 1.0 + cfg.hard_mining_sample_boost * replay_factor
         weights.append(weight)
 
     arr = np.asarray(weights, dtype=np.float64)
+    arr = arr / arr.mean()
+    arr = np.power(np.clip(arr, 1e-12, None), cfg.sample_weight_temperature)
+    arr = np.clip(arr, cfg.sample_weight_clip_min, cfg.sample_weight_clip_max)
     arr = arr / arr.mean()
     return arr
 
