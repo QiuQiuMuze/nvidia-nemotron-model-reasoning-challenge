@@ -117,9 +117,10 @@ class CFG:
     final_export_info_path: str = "/kaggle/working/nemotron_advanced/final_export_info.json"
     snapshot_root_dir: str = "/kaggle/working/nemotron_advanced/snapshots"
     best_score_epsilon: float = 1e-12
-    topk_min_global_step: int = 50
+    topk_min_global_step: int = 100
     final_rerank_run_submission_style: bool = True
     final_rerank_submission_rows: int = 128
+    reload_stage1_best_candidate: bool = False
 
     # ===== reproducibility =====
     seed: int = 3407
@@ -147,9 +148,9 @@ class CFG:
     lora_dropout: float = 0.05
 
     # ===== split / eval =====
-    valid_size: float = 0.08
-    fast_eval_examples: int = 96
-    serious_eval_examples: int = 256
+    valid_size: float = 0.12
+    fast_eval_examples: int = 128
+    serious_eval_examples: int = 384
     serious_eval_seeds: Tuple[int, ...] = (11, 23, 47)
     # 官方文案仅说明“relative numerical tolerance”，未公开具体数值；
     # 这里采用更严格容差，避免本地分数乐观偏高。
@@ -168,7 +169,7 @@ class CFG:
 
     # ===== optional leaderboard tricks =====
     enable_external_mixture: bool = True
-    enable_prompt_template_ablation: bool = True
+    enable_prompt_template_ablation: bool = False
     enable_family_reweight: bool = True
     enable_length_bucket_bonus: bool = True
     run_supervision_ablation: bool = False
@@ -178,7 +179,7 @@ class CFG:
     supervision_ablation_stage2_epochs: float = 0.20
     supervision_ablation_stage2_rounds: int = 1
     reasoning_template_eval_rows: int = 48
-    enable_consensus_pseudolabel_refresh: bool = True
+    enable_consensus_pseudolabel_refresh: bool = False
     consensus_pseudolabel_max_rows: int = 192
     consensus_pseudolabel_allowed_families: Tuple[str, ...] = ("bit_transform", "sequence", "matrix_reasoning")
     consensus_template_ids: Tuple[str, ...] = (
@@ -203,7 +204,7 @@ class CFG:
     template_ablation_secondary_max_drop: float = 0.01
     template_ablation_strong_family_accuracy: float = 0.85
     template_ablation_strong_family_min_gain: float = 0.04
-    stage2_asset_refresh_interval_rounds: int = 1
+    stage2_asset_refresh_interval_rounds: int = 2
     stage2_refresh_template_eval_rows: int = 96
     stage2_refresh_weak_family_top_k: int = 3
     stage2_refresh_min_weak_family_gain: float = 0.005
@@ -214,7 +215,7 @@ class CFG:
     hard_mining_template_group_boost: float = 0.20
     hard_mining_answer_type_boost: float = 0.20
     hard_mining_bucket_boost: float = 0.15
-    hard_mining_sample_boost: float = 0.90
+    hard_mining_sample_boost: float = 0.35
     replay_probe_rows: int = 128
     short_text_weight_boost: float = 1.25
     open_template_short_text_extra_boost: float = 1.10
@@ -3708,20 +3709,24 @@ if stage1_best_candidate is not None:
             round_idx=0,
         )
 
-    # 用 stage1 最高 accur 的 adapter 覆盖当前训练中的 LoRA 权重
-    model = reload_saved_adapter_into_current_model(
-        model=model,
-        adapter_dir=stage1_best_candidate["candidate_dir"],
-    )
+    if cfg.reload_stage1_best_candidate:
+        # 可选：用 stage1 最高 local accur 的 adapter 覆盖当前训练中的 LoRA 权重
+        # 默认关闭，避免对 fast-eval 子集过拟合并把偏差带入 Stage 2。
+        model = reload_saved_adapter_into_current_model(
+            model=model,
+            adapter_dir=stage1_best_candidate["candidate_dir"],
+        )
 
-    # 重新绑定 collator，避免它继续引用旧状态
-    collator = DataCollatorForSeq2Seq(
-        tokenizer=tokenizer,
-        model=model,
-        padding=True,
-        pad_to_multiple_of=8,
-        return_tensors="pt",
-    )
+        # 重新绑定 collator，避免它继续引用旧状态
+        collator = DataCollatorForSeq2Seq(
+            tokenizer=tokenizer,
+            model=model,
+            padding=True,
+            pad_to_multiple_of=8,
+            return_tensors="pt",
+        )
+    else:
+        print("[stage1 best] skip reloading best local-accuracy adapter before stage2 (cfg.reload_stage1_best_candidate=False)")
 else:
     print("[stage1 best] no saved stage1 candidate found; keep current in-memory model")
 
