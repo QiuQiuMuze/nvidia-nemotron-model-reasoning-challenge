@@ -3874,15 +3874,6 @@ stage2_local_callback = LocalAccuracyCallback(
     min_global_step=cfg.topk_min_global_step,
     manifest_path=None if cfg.smoke_test_mode else cfg.stage2_topk_manifest_path,
 )
-# Cell 20.5
-def export_current_model_as_round_submission(
-    model: torch.nn.Module,
-    round_idx: int,
-) -> Path:
-    return export_model_as_round_submission(
-        model=model,
-        round_idx=round_idx,
-    )
 
 # %% [markdown]
 # ## Cell 21 — Stage 2 训练（多轮重加权，而非轮间重建数据资产）
@@ -3948,6 +3939,18 @@ if (not cfg.smoke_test_mode) and cfg.save_final_snapshot_before_post_eval:
         tag="after_stage2_train",
     )
     cleanup_cuda()
+
+# Cell 21.5
+if (not cfg.smoke_test_mode) and cfg.save_final_snapshot_before_post_eval:
+    save_adapter_snapshot(
+        model,
+        tokenizer,
+        str(Path(cfg.snapshot_root_dir) / "after_stage2_train"),
+        tag="after_stage2_train",
+    )
+    cleanup_cuda()
+
+
 # Cell 22A
 def safe_post_eval_block(name: str, fn, fail_open: bool = True):
     print(f"\n[post-eval:start] {name}")
@@ -4080,6 +4083,53 @@ else:
 
 
 # Cell 22.9
+def export_current_model_as_round_submission(
+    model: torch.nn.Module,
+    round_idx: int,
+) -> Path:
+    """
+    把当前内存中的 model 导出成一个可提交 zip：
+    /kaggle/working/nemotron_advanced/round_submissions/{round_idx}.zip
+    """
+    round_idx = int(round_idx)
+    round_root = Path(cfg.round_submission_dir)
+    round_root.mkdir(parents=True, exist_ok=True)
+
+    tmp_adapter_dir = round_root / f"round_{round_idx}_adapter"
+    zip_path = round_root / f"{round_idx}.zip"
+
+    if tmp_adapter_dir.exists():
+        shutil.rmtree(tmp_adapter_dir, ignore_errors=True)
+    tmp_adapter_dir.mkdir(parents=True, exist_ok=True)
+
+    if zip_path.exists():
+        zip_path.unlink()
+
+    # 先导出当前 round 结束时的 adapter
+    model.save_pretrained(tmp_adapter_dir)
+
+    allowed_submit_files = {
+        "adapter_config.json",
+        "adapter_model.safetensors",
+        "adapter_model.bin",
+    }
+
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        found = set()
+        for path in sorted(tmp_adapter_dir.iterdir()):
+            if path.is_file() and path.name in allowed_submit_files:
+                zf.write(path, arcname=path.name)
+                found.add(path.name)
+
+    assert "adapter_config.json" in found, f"{zip_path.name} 缺少 adapter_config.json"
+    assert ("adapter_model.safetensors" in found) or ("adapter_model.bin" in found), f"{zip_path.name} 缺少 adapter 权重文件"
+
+    print(f"[round-export] saved round {round_idx} zip -> {zip_path}")
+    print(f"[round-export] packed files -> {sorted(found)}")
+    print(f"[round-export] zip size (MB) -> {round(zip_path.stat().st_size / 1024 / 1024, 3)}")
+
+    return zip_path
+
 def _candidate_eval_target_device() -> str:
     return "cuda:0" if torch.cuda.is_available() else "cpu"
 
@@ -4564,7 +4614,6 @@ def release_training_objects_before_reload() -> None:
             f"[smoke] CUDA free after release: "
             f"{free_bytes / (1024 ** 3):.2f} / {total_bytes / (1024 ** 3):.2f} GiB"
         )
-
 # Cell 24.5
 def smoke_reload_exported_adapter_check(
     adapter_dir: Path,
