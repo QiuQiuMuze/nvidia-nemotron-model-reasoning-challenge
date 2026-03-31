@@ -89,6 +89,7 @@ class CFG:
     official_temperature: float = 0.0
     official_top_p: float = 1.0
     official_max_model_len: int = 8192
+    official_eval_mode: bool = True
     warmup_steps_override: Optional[int] = None
 
     # ===== paths =====
@@ -116,9 +117,10 @@ class CFG:
     final_export_info_path: str = "/kaggle/working/nemotron_advanced/final_export_info.json"
     snapshot_root_dir: str = "/kaggle/working/nemotron_advanced/snapshots"
     best_score_epsilon: float = 1e-12
-    topk_min_global_step: int = 50
+    topk_min_global_step: int = 100
     final_rerank_run_submission_style: bool = True
     final_rerank_submission_rows: int = 128
+    reload_stage1_best_candidate: bool = False
 
     # ===== reproducibility =====
     seed: int = 3407
@@ -126,7 +128,8 @@ class CFG:
     # ===== training =====
     use_bf16: bool = True
     use_4bit: bool = True
-    max_seq_len: int = 2048
+    # 与官方推理窗口对齐（若硬件允许）。
+    max_seq_len: int = 8192
     micro_batch_size: int = 1
     eval_batch_size: int = 1
     grad_accum: int = 16
@@ -136,7 +139,8 @@ class CFG:
     save_steps: int = 50
     eval_steps: int = 50
     max_grad_norm: float = 0.3
-    enable_gradient_checkpointing: bool = False
+    # 长上下文训练默认开启 checkpointing 以提升稳定性与显存可用性。
+    enable_gradient_checkpointing: bool = True
     force_nemotron_torch_fallback: bool = False
     cuda_load_headroom_gib: int = 6
 
@@ -146,35 +150,42 @@ class CFG:
     lora_dropout: float = 0.05
 
     # ===== split / eval =====
-    valid_size: float = 0.08
-    fast_eval_examples: int = 96
-    serious_eval_examples: int = 256
+    valid_size: float = 0.12
+    fast_eval_examples: int = 128
+    serious_eval_examples: int = 384
     serious_eval_seeds: Tuple[int, ...] = (11, 23, 47)
-    numeric_rel_tol: float = 1e-2
-    prefer_official_metric_backend: bool = True
+    # 官方文案仅说明“relative numerical tolerance”，未公开具体数值；
+    # 这里采用更严格容差，避免本地分数乐观偏高。
+    numeric_rel_tol: float = 1e-4
+    # 由于比赛方隐藏官方评测实现，本地一律使用“官方公开描述模拟器”，不再尝试动态加载官方 backend 文件。
+    prefer_official_metric_backend: bool = False
     official_metric_backend_path: Optional[str] = None
 
     # ===== curriculum =====
     stage1_epochs: float = 0.9
     stage2_epochs: float = 2.8
     stage2_rounds: int = 4
-    stage1_max_prompt_chars: int = 1200
-    stage1_lr: float = 1.6e-4
-    stage2_lr: float = 9e-5
+    stage1_max_prompt_chars: int = 1800
+    # 长上下文下适度降低学习率，减少训练振荡。
+    stage1_lr: float = 1.2e-4
+    stage2_lr: float = 7e-5
 
     # ===== optional leaderboard tricks =====
     enable_external_mixture: bool = True
-    enable_prompt_template_ablation: bool = True
+    enable_prompt_template_ablation: bool = False
     enable_family_reweight: bool = True
     enable_length_bucket_bonus: bool = True
     run_supervision_ablation: bool = False
     primary_supervision_variant: str = "family_aware_mix"
+    # 训练提示词风格：official_single_prompt 更贴近评测；hybrid 兼顾稳定性。
+    training_prompt_style: str = "hybrid"  # "chat_template" | "official_single_prompt" | "hybrid"
+    training_official_prompt_ratio: float = 0.60
     supervision_ablation_variants: Tuple[str, ...] = ("answer_only", "short_reasoning", "family_aware_mix")
     supervision_ablation_stage1_epochs: float = 0.20
     supervision_ablation_stage2_epochs: float = 0.20
     supervision_ablation_stage2_rounds: int = 1
     reasoning_template_eval_rows: int = 48
-    enable_consensus_pseudolabel_refresh: bool = True
+    enable_consensus_pseudolabel_refresh: bool = False
     consensus_pseudolabel_max_rows: int = 192
     consensus_pseudolabel_allowed_families: Tuple[str, ...] = ("bit_transform", "sequence", "matrix_reasoning")
     consensus_template_ids: Tuple[str, ...] = (
@@ -199,24 +210,39 @@ class CFG:
     template_ablation_secondary_max_drop: float = 0.01
     template_ablation_strong_family_accuracy: float = 0.85
     template_ablation_strong_family_min_gain: float = 0.04
-    stage2_asset_refresh_interval_rounds: int = 1
+    stage2_asset_refresh_interval_rounds: int = 2
     stage2_refresh_template_eval_rows: int = 96
     stage2_refresh_weak_family_top_k: int = 3
     stage2_refresh_min_weak_family_gain: float = 0.005
     stage2_refresh_replay_family_error_threshold: float = 0.40
     fixed_sanity_rows: int = 64
-    stage1_family_frequency_quantile: float = 0.35
+    stage1_family_frequency_quantile: float = 0.20
     hard_mining_family_boost: float = 0.50
     hard_mining_template_group_boost: float = 0.20
     hard_mining_answer_type_boost: float = 0.20
     hard_mining_bucket_boost: float = 0.15
-    hard_mining_sample_boost: float = 0.90
+    hard_mining_sample_boost: float = 0.35
+    use_log_replay_boost: bool = True
+    sample_weight_clip_min: float = 0.35
+    sample_weight_clip_max: float = 2.80
+    sample_weight_temperature: float = 0.80
+    stage1_low_freq_sample_ratio: float = 0.30
+    family_aware_short_reasoning_ratio: float = 0.35
     replay_probe_rows: int = 128
     short_text_weight_boost: float = 1.25
     open_template_short_text_extra_boost: float = 1.10
     multi_token_text_weight_boost: float = 1.15
     cipher_decrypt_family_weight_boost: float = 1.20
     allow_target_auto_discovery: bool = False
+
+    # ===== external data hygiene =====
+    external_prompt_min_chars: int = 80
+    external_prompt_max_chars: int = 6000
+    external_answer_min_chars: int = 1
+    external_answer_max_chars: int = 96
+    unlabeled_prompt_min_chars: int = 80
+    unlabeled_prompt_max_chars: int = 6000
+    external_require_keyword_pattern: bool = False
 
     # ===== runtime control =====
     run_stage1_multi_seed_eval: bool = True
@@ -431,9 +457,10 @@ def filter_external_data(df: pd.DataFrame) -> pd.DataFrame:
     tmp = df.copy()
     tmp["prompt"] = tmp["prompt"].astype(str)
     tmp["answer"] = tmp["answer"].astype(str).str.strip()
-    tmp = tmp[tmp["prompt"].str.len().between(40, 12000)]
-    tmp = tmp[tmp["answer"].str.len().between(1, 160)]
-    tmp = tmp[tmp["prompt"].str.contains("->|example|Examples|Now|Solve|Task|Question", regex=True, na=False)]
+    tmp = tmp[tmp["prompt"].str.len().between(cfg.external_prompt_min_chars, cfg.external_prompt_max_chars)]
+    tmp = tmp[tmp["answer"].str.len().between(cfg.external_answer_min_chars, cfg.external_answer_max_chars)]
+    if cfg.external_require_keyword_pattern:
+        tmp = tmp[tmp["prompt"].str.contains("->|example|Examples|Now|Solve|Task|Question", regex=True, na=False)]
     tmp = tmp[~tmp["answer"].str.contains("todo|unknown|n/a", case=False, na=False)]
     return tmp.reset_index(drop=True)
 
@@ -464,8 +491,9 @@ def filter_unlabeled_pool(df: pd.DataFrame) -> pd.DataFrame:
         return df
     tmp = df.copy()
     tmp["prompt"] = tmp["prompt"].astype(str)
-    tmp = tmp[tmp["prompt"].str.len().between(40, 12000)]
-    tmp = tmp[tmp["prompt"].str.contains("->|example|Examples|Now|Solve|Task|Question", regex=True, na=False)]
+    tmp = tmp[tmp["prompt"].str.len().between(cfg.unlabeled_prompt_min_chars, cfg.unlabeled_prompt_max_chars)]
+    if cfg.external_require_keyword_pattern:
+        tmp = tmp[tmp["prompt"].str.contains("->|example|Examples|Now|Solve|Task|Question", regex=True, na=False)]
     return tmp.reset_index(drop=True)
 
 external_df = load_optional_external_data(cfg.extra_data_dir) if cfg.enable_external_mixture else pd.DataFrame(columns=["id", "prompt", "answer", "source"])
@@ -814,55 +842,33 @@ def official_like_extract_prediction(text: str) -> str:
     return canonicalize_answer(lines[-1] if lines else text)
 
 
+def strict_official_fallback_extract_prediction(text: str) -> str:
+    """
+    兜底实现尽量贴近官方公开描述：
+    1) 优先 boxed；
+    2) 再尝试 final-answer pattern；
+    3) 再尝试其余启发式；
+    4) 最后取最后一个 numeric；
+    若都失败则返回规范化后的全文。
+    """
+    for fn in (extract_boxed, extract_final_answer_pattern, extract_other_heuristics, extract_last_numeric):
+        result = fn(text)
+        if result is not None:
+            return result
+    return canonicalize_answer(text)
+
+
 def extract_prediction(text: str) -> str:
     return official_like_extract_prediction(text)
 
 
-def load_official_metric_backend() -> Optional[Any]:
-    if not cfg.prefer_official_metric_backend:
-        return None
-
-    candidate_paths: List[Path] = []
-    if cfg.official_metric_backend_path:
-        candidate_paths.append(Path(cfg.official_metric_backend_path))
-    candidate_paths.extend([
-        Path(cfg.competition_path) / "evaluation.py",
-        Path(cfg.competition_path) / "metric.py",
-        Path("evaluation.py"),
-        Path("metric.py"),
-    ])
-
-    for path in candidate_paths:
-        if not path.exists():
-            continue
-        spec = importlib.util.spec_from_file_location("nemotron_official_metric", path)
-        if spec is None or spec.loader is None:
-            continue
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        extract_fn = getattr(module, "extract_prediction", None) or getattr(module, "extract_answer", None)
-        score_fn = getattr(module, "score_prediction", None) or getattr(module, "score", None)
-        if extract_fn is not None:
-            print(f"loaded official metric backend from: {path}")
-            return {"path": str(path), "extract_fn": extract_fn, "score_fn": score_fn}
-    print("official metric backend not found; fallback to local official_like extractor")
-    return None
-
-
-OFFICIAL_METRIC_BACKEND = load_official_metric_backend()
-
-
 def metric_extract_prediction(text: str) -> str:
-    if OFFICIAL_METRIC_BACKEND is not None:
-        return canonicalize_answer(OFFICIAL_METRIC_BACKEND["extract_fn"](text))
-    return official_like_extract_prediction(text)
+    return strict_official_fallback_extract_prediction(text)
 
 
 def approx_equal(pred: str, gold: str, rel_tol: float = cfg.numeric_rel_tol) -> bool:
     pred_c = canonicalize_answer(pred)
     gold_c = canonicalize_answer(gold)
-    if OFFICIAL_METRIC_BACKEND is not None and OFFICIAL_METRIC_BACKEND.get("score_fn") is not None:
-        return bool(OFFICIAL_METRIC_BACKEND["score_fn"](pred_c, gold_c))
     if pred_c == gold_c:
         return True
 
@@ -895,6 +901,16 @@ SYSTEM_PROMPT = (
     "You are a careful reasoning model. Solve the task accurately. "
     "Return the final answer only, enclosed in \\boxed{} with no extra commentary."
 )
+OFFICIAL_EVAL_PROMPT_SUFFIX = (
+    "\n\nPlease reason carefully and put your final answer inside \\boxed{}."
+)
+
+
+def build_official_eval_prompt(problem: str) -> str:
+    """
+    官方评测近似提示：不依赖自定义模板池，直接在题目后附加 boxed 指令。
+    """
+    return f"{problem}{OFFICIAL_EVAL_PROMPT_SUFFIX}"
 
 
 def template_compact(problem: str) -> str:
@@ -1104,7 +1120,24 @@ def build_short_reasoning_scaffold(answer: Any, answer_type: str, prompt_family:
 # %%
 
 def build_training_record(row: pd.Series) -> Dict[str, Any]:
-    template_id, prompt_text = choose_template(row.prompt, row.answer_type, row.prompt_family)
+    template_id, chat_prompt_text = choose_template(row.prompt, row.answer_type, row.prompt_family)
+    official_prompt_text = build_official_eval_prompt(row.prompt)
+
+    if cfg.training_prompt_style == "official_single_prompt":
+        prompt_text = official_prompt_text
+        template_id = "OFFICIAL_SINGLE_PROMPT"
+    elif cfg.training_prompt_style == "chat_template":
+        prompt_text = chat_prompt_text
+    else:
+        # hybrid：按样本稳定哈希决定是否使用 official prompt，减少 train/eval prompt mismatch。
+        sample_key = str(row.id) if pd.notna(row.id) else str(row.prompt)[:128]
+        use_official = (int(hashlib.md5(sample_key.encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF) < cfg.training_official_prompt_ratio
+        if use_official:
+            prompt_text = official_prompt_text
+            template_id = "OFFICIAL_SINGLE_PROMPT"
+        else:
+            prompt_text = chat_prompt_text
+
     answer_text = boxed(row.answer)
     short_reasoning_text = build_short_reasoning_scaffold(row.answer, row.answer_type, row.prompt_family)
     full_text = prompt_text + answer_text
@@ -1168,7 +1201,7 @@ def split_stage_records(records_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Data
     stable_families = set(
         family_freq[family_freq >= family_freq.quantile(cfg.stage1_family_frequency_quantile)].index.tolist()
     )
-    stage1_mask = (
+    stage1_primary_mask = (
             records_df["prompt_chars"].le(cfg.stage1_max_prompt_chars)
             & records_df["prompt_family"].isin(stable_families)
             & (
@@ -1180,7 +1213,22 @@ def split_stage_records(records_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Data
                     )
             )
     )
-    stage1_records_local = records_df.loc[stage1_mask].reset_index(drop=True)
+    stage1_primary = records_df.loc[stage1_primary_mask].copy()
+
+    # 兼容低频 family：按比例混入低频样本，避免 Stage1 完全忽略尾部分布。
+    stage1_low_freq = records_df.loc[
+        records_df["prompt_chars"].le(cfg.stage1_max_prompt_chars)
+        & ~records_df["prompt_family"].isin(stable_families)
+    ].copy()
+    if len(stage1_primary) > 0 and len(stage1_low_freq) > 0 and cfg.stage1_low_freq_sample_ratio > 0:
+        low_freq_take = int(max(1, round(len(stage1_primary) * cfg.stage1_low_freq_sample_ratio)))
+        low_freq_take = min(low_freq_take, len(stage1_low_freq))
+        stage1_low_freq = stage1_low_freq.sample(n=low_freq_take, random_state=cfg.seed)
+        stage1_records_local = pd.concat([stage1_primary, stage1_low_freq], ignore_index=True)
+    else:
+        stage1_records_local = stage1_primary
+
+    stage1_records_local = stage1_records_local.drop_duplicates(subset=["id"]).reset_index(drop=True)
     stage2_records_local = records_df.reset_index(drop=True)
     return stage1_records_local, stage2_records_local, stable_families
 
@@ -1299,6 +1347,14 @@ def make_supervision_frame(df: pd.DataFrame, supervision_variant: str) -> pd.Dat
                 & tmp["answer_type"].isin({"short_text", "multi_token_text"})
             )
         )
+        ratio = float(np.clip(cfg.family_aware_short_reasoning_ratio, 0.0, 1.0))
+        hashed_ratio_gate = (
+            tmp["id"]
+            .astype(str)
+            .map(lambda x: int(hashlib.md5(x.encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF)
+            .lt(ratio)
+        )
+        use_short_reasoning = use_short_reasoning & hashed_ratio_gate
 
         tmp["supervision_variant"] = np.where(
             use_short_reasoning,
@@ -1963,10 +2019,18 @@ def compute_sample_weights(
             weight *= 1.0 + cfg.hard_mining_answer_type_boost * hard_profile["answer_type"].get(row.answer_type, 0.0)
             weight *= 1.0 + cfg.hard_mining_bucket_boost * hard_profile["len_bucket"].get(row.len_bucket, 0.0)
         if replay_buffer is not None:
-            weight *= 1.0 + cfg.hard_mining_sample_boost * replay_buffer.get(row.id, 0)
+            replay_hit = replay_buffer.get(row.id, 0)
+            if cfg.use_log_replay_boost:
+                replay_factor = math.log1p(float(replay_hit))
+            else:
+                replay_factor = float(replay_hit)
+            weight *= 1.0 + cfg.hard_mining_sample_boost * replay_factor
         weights.append(weight)
 
     arr = np.asarray(weights, dtype=np.float64)
+    arr = arr / arr.mean()
+    arr = np.power(np.clip(arr, 1e-12, None), cfg.sample_weight_temperature)
+    arr = np.clip(arr, cfg.sample_weight_clip_min, cfg.sample_weight_clip_max)
     arr = arr / arr.mean()
     return arr
 
@@ -2077,7 +2141,13 @@ print("train replay probe subset:", train_replay_probe_df.shape)
 
 
 @torch.no_grad()
-def generate_answer_text(model: torch.nn.Module, prompt: str, max_new_tokens: int = 96) -> str:
+def generate_answer_text(
+    model: torch.nn.Module,
+    prompt: str,
+    max_new_tokens: int = 96,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+) -> str:
     prev_training = model.training
     prev_use_cache = getattr(model.config, "use_cache", None)
 
@@ -2092,7 +2162,9 @@ def generate_answer_text(model: torch.nn.Module, prompt: str, max_new_tokens: in
         outputs = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
-            do_sample=False,
+            do_sample=bool(temperature and temperature > 0),
+            temperature=temperature,
+            top_p=top_p,
             pad_token_id=tokenizer.eos_token_id,
         )
 
@@ -2198,30 +2270,84 @@ def predict_one_row(
 
 
 @torch.no_grad()
+def predict_one_row_official(
+    model: torch.nn.Module,
+    row: Any,
+    max_new_tokens: Optional[int] = None,
+    extractor_fn=metric_extract_prediction,
+) -> Dict[str, Any]:
+    prompt_text = row.prompt if hasattr(row, "prompt") else row["prompt"]
+    prompt_family = infer_prompt_family(prompt_text)
+    answer_type = infer_expected_answer_type_from_prompt(prompt_text)
+    eval_prompt = build_official_eval_prompt(prompt_text)
+    raw = generate_answer_text(
+        model,
+        eval_prompt,
+        max_new_tokens=cfg.official_max_new_tokens if max_new_tokens is None else max_new_tokens,
+        temperature=cfg.official_temperature,
+        top_p=cfg.official_top_p,
+    ).strip()
+    pred = extractor_fn(raw)
+    boxed_answer = extract_boxed(raw)
+    return {
+        "pred": canonicalize_answer(pred),
+        "consensus_votes": 1,
+        "num_templates": 1,
+        "decision_type": "official_single_prompt",
+        "fallback_used": False,
+        "template_ids": ["OFFICIAL_SINGLE_PROMPT"],
+        "candidates": [
+            {
+                "template_id": "OFFICIAL_SINGLE_PROMPT",
+                "raw": raw[:1200],
+                "answer": canonicalize_answer(pred),
+                "has_boxed": "\\boxed{" in raw,
+                "boxed_answer": boxed_answer,
+            }
+        ],
+        "prompt_family": prompt_family,
+        "answer_type": answer_type,
+        "gold": canonicalize_answer(getattr(row, "answer", "")),
+    }
+
+
+@torch.no_grad()
 def evaluate_accuracy(
     model: torch.nn.Module,
     df: pd.DataFrame,
     template_override: Optional[str] = None,
     max_new_tokens_grid: Sequence[int] = (64, 96),
     extractor_fn=metric_extract_prediction,
+    use_official_eval_mode: Optional[bool] = None,
 ) -> Tuple[float, pd.DataFrame]:
+    if use_official_eval_mode is None:
+        use_official_eval_mode = cfg.official_eval_mode
+
     rows = []
     for row in df.itertuples(index=False):
         prompt_family = infer_prompt_family(row.prompt)
         answer_type = infer_expected_answer_type_from_prompt(row.prompt)
-        routed_templates = [template_override] if template_override is not None else router_get_templates(
-            prompt_family,
-            answer_type=answer_type,
-            top_k=1,
-        )
-        result = predict_one_row(
-            model,
-            row,
-            template_ids=routed_templates,
-            fallback_template_id=None if template_override is not None else cfg.fallback_template_id,
-            max_new_tokens_grid=max_new_tokens_grid,
-            extractor_fn=extractor_fn,
-        )
+        if use_official_eval_mode:
+            result = predict_one_row_official(
+                model,
+                row,
+                max_new_tokens=cfg.official_max_new_tokens,
+                extractor_fn=extractor_fn,
+            )
+        else:
+            routed_templates = [template_override] if template_override is not None else router_get_templates(
+                prompt_family,
+                answer_type=answer_type,
+                top_k=1,
+            )
+            result = predict_one_row(
+                model,
+                row,
+                template_ids=routed_templates,
+                fallback_template_id=None if template_override is not None else cfg.fallback_template_id,
+                max_new_tokens_grid=max_new_tokens_grid,
+                extractor_fn=extractor_fn,
+            )
         matched_candidate = next((c for c in result["candidates"] if c.get("answer") == result["pred"]), None)
         candidate_raw = matched_candidate["raw"] if matched_candidate is not None else (result["candidates"][0]["raw"] if result["candidates"] else "")
         boxed_hit = any(candidate.get("has_boxed", False) for candidate in result["candidates"])
@@ -2692,16 +2818,19 @@ def offline_submission_style_eval(
 ) -> Tuple[float, pd.DataFrame]:
     rows = []
     for row in valid_df.itertuples(index=False):
-        routed_templates = router_get_templates(
-            infer_prompt_family(row.prompt),
-            answer_type=infer_expected_answer_type_from_prompt(row.prompt),
-            top_k=top_k,
-        )
-        result = predict_one_row(
-            model,
-            row,
-            template_ids=routed_templates,
-        )
+        if cfg.official_eval_mode:
+            result = predict_one_row_official(model, row, max_new_tokens=cfg.official_max_new_tokens)
+        else:
+            routed_templates = router_get_templates(
+                infer_prompt_family(row.prompt),
+                answer_type=infer_expected_answer_type_from_prompt(row.prompt),
+                top_k=top_k,
+            )
+            result = predict_one_row(
+                model,
+                row,
+                template_ids=routed_templates,
+            )
         gold = canonicalize_answer(row.answer)
         rows.append(
             {
@@ -3651,20 +3780,24 @@ if stage1_best_candidate is not None:
             round_idx=0,
         )
 
-    # 用 stage1 最高 accur 的 adapter 覆盖当前训练中的 LoRA 权重
-    model = reload_saved_adapter_into_current_model(
-        model=model,
-        adapter_dir=stage1_best_candidate["candidate_dir"],
-    )
+    if cfg.reload_stage1_best_candidate:
+        # 可选：用 stage1 最高 local accur 的 adapter 覆盖当前训练中的 LoRA 权重
+        # 默认关闭，避免对 fast-eval 子集过拟合并把偏差带入 Stage 2。
+        model = reload_saved_adapter_into_current_model(
+            model=model,
+            adapter_dir=stage1_best_candidate["candidate_dir"],
+        )
 
-    # 重新绑定 collator，避免它继续引用旧状态
-    collator = DataCollatorForSeq2Seq(
-        tokenizer=tokenizer,
-        model=model,
-        padding=True,
-        pad_to_multiple_of=8,
-        return_tensors="pt",
-    )
+        # 重新绑定 collator，避免它继续引用旧状态
+        collator = DataCollatorForSeq2Seq(
+            tokenizer=tokenizer,
+            model=model,
+            padding=True,
+            pad_to_multiple_of=8,
+            return_tensors="pt",
+        )
+    else:
+        print("[stage1 best] skip reloading best local-accuracy adapter before stage2 (cfg.reload_stage1_best_candidate=False)")
 else:
     print("[stage1 best] no saved stage1 candidate found; keep current in-memory model")
 
@@ -4531,11 +4664,19 @@ else:
 smoke_df = test_df.head(5).copy()
 smoke_rows = []
 for row in smoke_df.itertuples(index=False):
-    result = submission_style_predict_row(
-        model,
-        row,
-        template_ids=router_get_templates(infer_prompt_family(row.prompt), top_k=cfg.test_time_router_top_k),
-    )
+    if cfg.official_eval_mode:
+        result = predict_one_row_official(
+            model,
+            row,
+            max_new_tokens=cfg.official_max_new_tokens,
+            extractor_fn=metric_extract_prediction,
+        )
+    else:
+        result = submission_style_predict_row(
+            model,
+            row,
+            template_ids=router_get_templates(infer_prompt_family(row.prompt), top_k=cfg.test_time_router_top_k),
+        )
     smoke_rows.append(
         {
             "id": row.id,
