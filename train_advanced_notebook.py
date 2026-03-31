@@ -165,6 +165,8 @@ class CFG:
     stage1_epochs: float = 0.9
     stage2_epochs: float = 2.8
     stage2_rounds: int = 4
+    # 如需减负可开启早轮 fast eval；默认关闭以避免 last_pred_df 噪声放大重加权偏差。
+    stage2_use_fast_eval_before_final: bool = False
     stage1_max_prompt_chars: int = 1800
     # 长上下文下适度降低学习率，减少训练振荡。
     stage1_lr: float = 1.2e-4
@@ -176,7 +178,7 @@ class CFG:
     enable_family_reweight: bool = True
     enable_length_bucket_bonus: bool = True
     run_supervision_ablation: bool = False
-    primary_supervision_variant: str = "family_aware_mix"
+    primary_supervision_variant: str = "answer_only"
     # 训练提示词风格：official_single_prompt 更贴近评测；hybrid 兼顾稳定性。
     training_prompt_style: str = "hybrid"  # "chat_template" | "official_single_prompt" | "hybrid"
     training_official_prompt_ratio: float = 0.60
@@ -3467,11 +3469,18 @@ def train_stage2_with_reweight(
         )
         trainer.train()
 
+        use_fast_round_eval = (
+            cfg.stage2_use_fast_eval_before_final
+            and (round_idx + 1) < cfg.stage2_rounds
+        )
+        round_eval_df = fast_eval_df if use_fast_round_eval else serious_eval_df
+        round_eval_views = {} if use_fast_round_eval else serious_eval_views
         round_acc, last_pred_df, round_multi_seed_df = run_serious_eval_suite(
             model,
-            serious_eval_df,
-            serious_eval_views,
+            round_eval_df,
+            round_eval_views,
             prefix=f"stage2_round_{round_idx + 1}",
+            run_multi_seed=(not use_fast_round_eval),
         )
 
         if cfg.save_stage2_round_submissions:
