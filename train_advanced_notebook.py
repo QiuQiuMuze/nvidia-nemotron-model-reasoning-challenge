@@ -177,6 +177,9 @@ class CFG:
     enable_length_bucket_bonus: bool = True
     run_supervision_ablation: bool = False
     primary_supervision_variant: str = "family_aware_mix"
+    # 训练提示词风格：official_single_prompt 更贴近评测；hybrid 兼顾稳定性。
+    training_prompt_style: str = "hybrid"  # "chat_template" | "official_single_prompt" | "hybrid"
+    training_official_prompt_ratio: float = 0.60
     supervision_ablation_variants: Tuple[str, ...] = ("answer_only", "short_reasoning", "family_aware_mix")
     supervision_ablation_stage1_epochs: float = 0.20
     supervision_ablation_stage2_epochs: float = 0.20
@@ -224,6 +227,7 @@ class CFG:
     sample_weight_clip_max: float = 2.80
     sample_weight_temperature: float = 0.80
     stage1_low_freq_sample_ratio: float = 0.30
+    family_aware_short_reasoning_ratio: float = 0.35
     replay_probe_rows: int = 128
     short_text_weight_boost: float = 1.25
     open_template_short_text_extra_boost: float = 1.10
@@ -238,6 +242,7 @@ class CFG:
     external_answer_max_chars: int = 96
     unlabeled_prompt_min_chars: int = 80
     unlabeled_prompt_max_chars: int = 6000
+    external_require_keyword_pattern: bool = False
 
     # ===== runtime control =====
     run_stage1_multi_seed_eval: bool = True
@@ -454,7 +459,8 @@ def filter_external_data(df: pd.DataFrame) -> pd.DataFrame:
     tmp["answer"] = tmp["answer"].astype(str).str.strip()
     tmp = tmp[tmp["prompt"].str.len().between(cfg.external_prompt_min_chars, cfg.external_prompt_max_chars)]
     tmp = tmp[tmp["answer"].str.len().between(cfg.external_answer_min_chars, cfg.external_answer_max_chars)]
-    tmp = tmp[tmp["prompt"].str.contains("->|example|Examples|Now|Solve|Task|Question", regex=True, na=False)]
+    if cfg.external_require_keyword_pattern:
+        tmp = tmp[tmp["prompt"].str.contains("->|example|Examples|Now|Solve|Task|Question", regex=True, na=False)]
     tmp = tmp[~tmp["answer"].str.contains("todo|unknown|n/a", case=False, na=False)]
     return tmp.reset_index(drop=True)
 
@@ -486,7 +492,8 @@ def filter_unlabeled_pool(df: pd.DataFrame) -> pd.DataFrame:
     tmp = df.copy()
     tmp["prompt"] = tmp["prompt"].astype(str)
     tmp = tmp[tmp["prompt"].str.len().between(cfg.unlabeled_prompt_min_chars, cfg.unlabeled_prompt_max_chars)]
-    tmp = tmp[tmp["prompt"].str.contains("->|example|Examples|Now|Solve|Task|Question", regex=True, na=False)]
+    if cfg.external_require_keyword_pattern:
+        tmp = tmp[tmp["prompt"].str.contains("->|example|Examples|Now|Solve|Task|Question", regex=True, na=False)]
     return tmp.reset_index(drop=True)
 
 external_df = load_optional_external_data(cfg.extra_data_dir) if cfg.enable_external_mixture else pd.DataFrame(columns=["id", "prompt", "answer", "source"])
@@ -1113,7 +1120,24 @@ def build_short_reasoning_scaffold(answer: Any, answer_type: str, prompt_family:
 # %%
 
 def build_training_record(row: pd.Series) -> Dict[str, Any]:
-    template_id, prompt_text = choose_template(row.prompt, row.answer_type, row.prompt_family)
+    template_id, chat_prompt_text = choose_template(row.prompt, row.answer_type, row.prompt_family)
+    official_prompt_text = build_official_eval_prompt(row.prompt)
+
+    if cfg.training_prompt_style == "official_single_prompt":
+        prompt_text = official_prompt_text
+        template_id = "OFFICIAL_SINGLE_PROMPT"
+    elif cfg.training_prompt_style == "chat_template":
+        prompt_text = chat_prompt_text
+    else:
+        # hybrid：按样本稳定哈希决定是否使用 official prompt，减少 train/eval prompt mismatch。
+        sample_key = str(row.id) if pd.notna(row.id) else str(row.prompt)[:128]
+        use_official = (int(hashlib.md5(sample_key.encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF) < cfg.training_official_prompt_ratio
+        if use_official:
+            prompt_text = official_prompt_text
+            template_id = "OFFICIAL_SINGLE_PROMPT"
+        else:
+            prompt_text = chat_prompt_text
+
     answer_text = boxed(row.answer)
     short_reasoning_text = build_short_reasoning_scaffold(row.answer, row.answer_type, row.prompt_family)
     full_text = prompt_text + answer_text
@@ -1323,6 +1347,14 @@ def make_supervision_frame(df: pd.DataFrame, supervision_variant: str) -> pd.Dat
                 & tmp["answer_type"].isin({"short_text", "multi_token_text"})
             )
         )
+        ratio = float(np.clip(cfg.family_aware_short_reasoning_ratio, 0.0, 1.0))
+        hashed_ratio_gate = (
+            tmp["id"]
+            .astype(str)
+            .map(lambda x: int(hashlib.md5(x.encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF)
+            .lt(ratio)
+        )
+        use_short_reasoning = use_short_reasoning & hashed_ratio_gate
 
         tmp["supervision_variant"] = np.where(
             use_short_reasoning,
@@ -4681,11 +4713,19 @@ else:
 smoke_df = test_df.head(5).copy()
 smoke_rows = []
 for row in smoke_df.itertuples(index=False):
-    result = submission_style_predict_row(
-        model,
-        row,
-        template_ids=router_get_templates(infer_prompt_family(row.prompt), top_k=cfg.test_time_router_top_k),
-    )
+    if cfg.official_eval_mode:
+        result = predict_one_row_official(
+            model,
+            row,
+            max_new_tokens=cfg.official_max_new_tokens,
+            extractor_fn=metric_extract_prediction,
+        )
+    else:
+        result = submission_style_predict_row(
+            model,
+            row,
+            template_ids=router_get_templates(infer_prompt_family(row.prompt), top_k=cfg.test_time_router_top_k),
+        )
     smoke_rows.append(
         {
             "id": row.id,
