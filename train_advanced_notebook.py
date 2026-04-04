@@ -2990,14 +2990,18 @@ class LocalAccuracyCallback(TrainerCallback):
         self.manifest_path = Path(manifest_path) if manifest_path is not None else None
 
         self.topk_candidates: List[Dict[str, Any]] = []
+        self.current_round_idx: int = 0
 
         if self.candidates_dir is not None:
             self.candidates_dir.mkdir(parents=True, exist_ok=True)
         if self.manifest_path is not None:
             self.manifest_path.parent.mkdir(parents=True, exist_ok=True)
 
+    def set_round_context(self, round_idx: int) -> None:
+        self.current_round_idx = int(round_idx)
+
     def _manifest_columns(self) -> List[str]:
-        return ["step", "local_accuracy", "candidate_dir"]
+        return ["round_idx", "step", "local_accuracy", "candidate_dir"]
 
     def _persist_topk_manifest(self) -> None:
         if self.manifest_path is None:
@@ -3033,11 +3037,13 @@ class LocalAccuracyCallback(TrainerCallback):
         kth_score = min(float(item["local_accuracy"]) for item in self.topk_candidates)
         return float(score) > kth_score + cfg.best_score_epsilon
 
-    def _save_topk_candidate(self, model: torch.nn.Module, step: int, score: float) -> None:
+    def _save_topk_candidate(self, model: torch.nn.Module, step: int, score: float, round_idx: int) -> None:
         if self.candidates_dir is None or self.tokenizer is None:
             return
 
-        candidate_dir = self.candidates_dir / f"step_{int(step):07d}_acc_{float(score):.6f}"
+        candidate_dir = self.candidates_dir / (
+            f"round_{int(round_idx):03d}_step_{int(step):07d}_acc_{float(score):.6f}"
+        )
         if candidate_dir.exists():
             shutil.rmtree(candidate_dir, ignore_errors=True)
         candidate_dir.mkdir(parents=True, exist_ok=True)
@@ -3047,10 +3053,14 @@ class LocalAccuracyCallback(TrainerCallback):
 
         self.topk_candidates = [
             item for item in self.topk_candidates
-            if int(item["step"]) != int(step)
+            if not (
+                int(item.get("round_idx", 0)) == int(round_idx)
+                and int(item["step"]) == int(step)
+            )
         ]
         self.topk_candidates.append(
             {
+                "round_idx": int(round_idx),
                 "step": int(step),
                 "local_accuracy": float(score),
                 "candidate_dir": str(candidate_dir),
@@ -3067,7 +3077,7 @@ class LocalAccuracyCallback(TrainerCallback):
 
         print(
             f"[top-k saved] metric={self.metric_name} "
-            f"step={step} score={score:.4f} "
+            f"round={round_idx} step={step} score={score:.4f} "
             f"kept={len(self.topk_candidates)}/{self.save_top_k}"
         )
 
@@ -3091,25 +3101,34 @@ class LocalAccuracyCallback(TrainerCallback):
         print(f"\n[local-accuracy] step={state.global_step} acc={acc:.4f}")
 
         if model is not None and self._should_save_candidate(int(state.global_step), float(acc)):
-            self._save_topk_candidate(model=model, step=int(state.global_step), score=float(acc))
+            self._save_topk_candidate(
+                model=model,
+                step=int(state.global_step),
+                score=float(acc),
+                round_idx=self.current_round_idx,
+            )
 
         return control
 
 def load_candidate_manifest(manifest_path: str) -> pd.DataFrame:
     manifest_path = Path(manifest_path)
     if not manifest_path.exists():
-        return pd.DataFrame(columns=["step", "local_accuracy", "candidate_dir"])
+        return pd.DataFrame(columns=["round_idx", "step", "local_accuracy", "candidate_dir"])
 
     out = pd.read_csv(manifest_path)
     if out.empty:
         return out
 
+    if "round_idx" not in out.columns:
+        out["round_idx"] = 0
     out = out.loc[out["candidate_dir"].map(lambda p: Path(p).exists())].copy()
-    return out.sort_values(["local_accuracy", "step"], ascending=[False, False]).reset_index(drop=True)
+    return out.sort_values(["local_accuracy", "round_idx", "step"], ascending=[False, False, False]).reset_index(drop=True)
 
 
-def pick_best_candidate_record(manifest_path: str) -> Optional[Dict[str, Any]]:
+def pick_best_candidate_record(manifest_path: str, round_idx: Optional[int] = None) -> Optional[Dict[str, Any]]:
     cand_df = load_candidate_manifest(manifest_path)
+    if round_idx is not None and not cand_df.empty:
+        cand_df = cand_df.loc[cand_df["round_idx"] == int(round_idx)].copy()
     if cand_df.empty:
         return None
     return cand_df.iloc[0].to_dict()
@@ -3458,6 +3477,8 @@ def train_stage2_with_reweight(
 
     for round_idx in range(cfg.stage2_rounds):
         round_name = f"stage2_round_{round_idx + 1}"
+        if round_callback is not None and hasattr(round_callback, "set_round_context"):
+            round_callback.set_round_context(round_idx + 1)
         trainer = WeightedTrainer(
             model=model,
             args=build_training_args(round_name, cfg.stage2_lr, per_round_epochs),
@@ -3484,7 +3505,10 @@ def train_stage2_with_reweight(
         )
 
         if cfg.save_stage2_round_submissions:
-            stage2_best_candidate = pick_best_candidate_record(cfg.stage2_topk_manifest_path)
+            stage2_best_candidate = pick_best_candidate_record(
+                cfg.stage2_topk_manifest_path,
+                round_idx=round_idx + 1,
+            )
 
             if stage2_best_candidate is not None:
                 export_candidate_dir_as_round_submission(
@@ -4361,7 +4385,7 @@ def load_topk_candidate_manifest() -> pd.DataFrame:
         stage1_df["candidate_stage"] = "stage1"
         return stage1_df.reset_index(drop=True)
 
-    return pd.DataFrame(columns=["step", "local_accuracy", "candidate_dir", "candidate_stage"])
+    return pd.DataFrame(columns=["round_idx", "step", "local_accuracy", "candidate_dir", "candidate_stage"])
 
 
 def rerank_topk_candidates(candidate_df: pd.DataFrame) -> pd.DataFrame:
