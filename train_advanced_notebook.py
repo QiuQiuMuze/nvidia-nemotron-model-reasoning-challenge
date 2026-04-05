@@ -174,7 +174,8 @@ class CFG:
     stage1_max_prompt_chars: int = 1800
     # 长上下文下适度降低学习率，减少训练振荡。
     stage1_lr: float = 1.2e-4
-    stage2_lr: float = 5e-5
+    # 轻微下调 Stage2 学习率，减少多轮重加权下的振荡。
+    stage2_lr: float = 4.5e-5
 
     # ===== optional leaderboard tricks =====
     enable_external_mixture: bool = True
@@ -228,14 +229,15 @@ class CFG:
     stage2_refresh_replay_family_error_threshold: float = 0.40
     fixed_sanity_rows: int = 64
     stage1_family_frequency_quantile: float = 0.20
-    hard_mining_family_boost: float = 0.50
+    # 适度降低 hard-mining 强度，优先稳住泛化后再追击难例。
+    hard_mining_family_boost: float = 0.35
     hard_mining_template_group_boost: float = 0.20
     hard_mining_answer_type_boost: float = 0.15
     hard_mining_bucket_boost: float = 0.15
-    hard_mining_sample_boost: float = 0.20
+    hard_mining_sample_boost: float = 0.12
     use_log_replay_boost: bool = True
     sample_weight_clip_min: float = 0.35
-    sample_weight_clip_max: float = 2.80
+    sample_weight_clip_max: float = 2.20
     sample_weight_temperature: float = 0.80
     stage1_low_freq_sample_ratio: float = 0.30
     # family_aware_mix 的基础 short_reasoning 比例（仅作用于命中的族群/题型）。
