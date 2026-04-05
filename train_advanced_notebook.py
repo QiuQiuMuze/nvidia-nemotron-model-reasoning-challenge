@@ -123,8 +123,6 @@ class CFG:
     topk_min_global_step: int = 100
     final_rerank_run_submission_style: bool = True
     final_rerank_submission_rows: int = 128
-    # 最终 rerank 默认合并 stage1 + stage2 top-k，避免 stage2 轻微退化时被单阶段候选池锁死。
-    final_rerank_merge_stage1_candidates: bool = True
     reload_stage1_best_candidate: bool = True
 
     # ===== reproducibility =====
@@ -4442,24 +4440,16 @@ def summarize_multi_seed_result(multi_seed_df: pd.DataFrame) -> Dict[str, float]
 
 def load_topk_candidate_manifest() -> pd.DataFrame:
     stage2_df = load_candidate_manifest(cfg.stage2_topk_manifest_path)
-    stage1_df = load_candidate_manifest(cfg.stage1_topk_manifest_path)
     if not stage2_df.empty:
         stage2_df = stage2_df.copy()
         stage2_df["candidate_stage"] = "stage2"
+    if not stage2_df.empty:
+        return stage2_df.reset_index(drop=True)
+
+    stage1_df = load_candidate_manifest(cfg.stage1_topk_manifest_path)
     if not stage1_df.empty:
         stage1_df = stage1_df.copy()
         stage1_df["candidate_stage"] = "stage1"
-
-    if cfg.final_rerank_merge_stage1_candidates:
-        merged = pd.concat([stage2_df, stage1_df], ignore_index=True)
-        if merged.empty:
-            return pd.DataFrame(columns=["round_idx", "step", "local_accuracy", "candidate_dir", "candidate_stage"])
-        merged = merged.drop_duplicates(subset=["candidate_dir"]).reset_index(drop=True)
-        return merged.sort_values(["local_accuracy", "round_idx", "step"], ascending=[False, False, False]).reset_index(drop=True)
-
-    if not stage2_df.empty:
-        return stage2_df.reset_index(drop=True)
-    if not stage1_df.empty:
         return stage1_df.reset_index(drop=True)
 
     return pd.DataFrame(columns=["round_idx", "step", "local_accuracy", "candidate_dir", "candidate_stage"])
