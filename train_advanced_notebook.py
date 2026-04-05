@@ -3974,6 +3974,16 @@ print("refreshed stage2 records:", stage2_records.shape)
 print("refreshed valid records:", valid_records.shape)
 print("updated stage2 weight summary:", np.quantile(stage2_weights, [0, 0.25, 0.5, 0.75, 1]))
 
+# Cell 20.5
+def export_current_model_as_round_submission(
+    model: torch.nn.Module,
+    round_idx: int,
+) -> Path:
+    return export_model_as_round_submission(
+        model=model,
+        round_idx=round_idx,
+    )
+
 hard_profile = build_hard_profile(stage1_pred_df)
 stage2_weights = compute_sample_weights(
     stage2_records,
