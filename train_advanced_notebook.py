@@ -86,6 +86,9 @@ class CFG:
     preferred_attn_implementation: str = "flash_attention_2"
     max_lora_rank: int = 32
     official_max_new_tokens: int = 7680
+    # 本地训练过程评估使用更短生成长度，显著降低时延与显存峰值；
+    # 最终离线复评可按需切回 official_max_new_tokens。
+    local_eval_max_new_tokens: int = 512
     official_temperature: float = 0.0
     official_top_p: float = 1.0
     official_max_model_len: int = 8192
@@ -136,8 +139,8 @@ class CFG:
     warmup_ratio: float = 0.05
     weight_decay: float = 0.01
     logging_steps: int = 10
-    save_steps: int = 50
-    eval_steps: int = 50
+    save_steps: int = 100
+    eval_steps: int = 100
     max_grad_norm: float = 0.3
     # 长上下文训练默认开启 checkpointing 以提升稳定性与显存可用性。
     enable_gradient_checkpointing: bool = True
@@ -152,8 +155,8 @@ class CFG:
     # ===== split / eval =====
     valid_size: float = 0.12
     fast_eval_examples: int = 128
-    serious_eval_examples: int = 384
-    serious_eval_seeds: Tuple[int, ...] = (11, 23, 47)
+    serious_eval_examples: int = 256
+    serious_eval_seeds: Tuple[int, ...] = (11,)
     # 官方文案仅说明“relative numerical tolerance”，未公开具体数值；
     # 这里采用更严格容差，避免本地分数乐观偏高。
     numeric_rel_tol: float = 1e-4
@@ -164,9 +167,9 @@ class CFG:
     # ===== curriculum =====
     stage1_epochs: float = 0.9
     stage2_epochs: float = 2.8
-    stage2_rounds: int = 4
+    stage2_rounds: int = 3
     # 如需减负可开启早轮 fast eval；默认关闭以避免 last_pred_df 噪声放大重加权偏差。
-    stage2_use_fast_eval_before_final: bool = False
+    stage2_use_fast_eval_before_final: bool = True
     stage1_max_prompt_chars: int = 1800
     # 长上下文下适度降低学习率，减少训练振荡。
     stage1_lr: float = 1.2e-4
@@ -178,7 +181,8 @@ class CFG:
     enable_family_reweight: bool = True
     enable_length_bucket_bonus: bool = True
     run_supervision_ablation: bool = False
-    primary_supervision_variant: str = "answer_only"
+    # 主监督切到 family_aware_mix：优先提升 short_text，同时保留 answer_only 的稳态样本。
+    primary_supervision_variant: str = "family_aware_mix"
     # 训练提示词风格：official_single_prompt 更贴近评测；hybrid 兼顾稳定性。
     training_prompt_style: str = "hybrid"  # "chat_template" | "official_single_prompt" | "hybrid"
     training_official_prompt_ratio: float = 0.60
@@ -229,10 +233,17 @@ class CFG:
     sample_weight_clip_max: float = 2.80
     sample_weight_temperature: float = 0.80
     stage1_low_freq_sample_ratio: float = 0.30
-    family_aware_short_reasoning_ratio: float = 0.35
+    # family_aware_mix 的基础 short_reasoning 比例（仅作用于命中的族群/题型）。
+    family_aware_short_reasoning_ratio: float = 0.30
+    # 在 family_aware_mix 中，short_text / multi_token_text 的最小 short_reasoning 覆盖率。
+    family_aware_min_text_reasoning_ratio: float = 0.40
+    # 是否把 numeric/binary 也纳入 short_reasoning。默认关闭，避免拖累已较强的数值题。
+    family_aware_enable_numeric_reasoning: bool = False
+    # 若开启 numeric/binary 的 short_reasoning，最多覆盖比例（安全阈值）。
+    family_aware_max_numeric_reasoning_ratio: float = 0.10
     replay_probe_rows: int = 128
-    short_text_weight_boost: float = 1.25
-    open_template_short_text_extra_boost: float = 1.10
+    short_text_weight_boost: float = 1.45
+    open_template_short_text_extra_boost: float = 1.25
     multi_token_text_weight_boost: float = 1.15
     cipher_decrypt_family_weight_boost: float = 1.20
     allow_target_auto_discovery: bool = False
@@ -247,9 +258,9 @@ class CFG:
     external_require_keyword_pattern: bool = False
 
     # ===== runtime control =====
-    run_stage1_multi_seed_eval: bool = True
+    run_stage1_multi_seed_eval: bool = False
     run_stage1_submission_style_eval: bool = True
-    run_post_train_heavy_eval: bool = True
+    run_post_train_heavy_eval: bool = False
     save_stage1_snapshot: bool = True
     save_final_snapshot_before_post_eval: bool = True
     post_eval_fail_open: bool = True
@@ -1330,33 +1341,56 @@ def tokenize_answer_only(example: Dict[str, Any]) -> Dict[str, Any]:
         "supervision_variant": example["supervision_variant"],
     }
 
+def _deterministic_ratio_mask(base_mask: pd.Series, ids: pd.Series, ratio: float) -> pd.Series:
+    ratio = float(np.clip(ratio, 0.0, 1.0))
+    selected = pd.Series(False, index=base_mask.index)
+    if ratio <= 0.0:
+        return selected
+    idx = base_mask[base_mask].index
+    if len(idx) == 0:
+        return selected
+    if ratio >= 1.0:
+        selected.loc[idx] = True
+        return selected
+
+    hashed = (
+        ids.loc[idx]
+        .astype(str)
+        .map(lambda x: int(hashlib.md5(x.encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF)
+    )
+    take_n = int(max(1, round(len(idx) * ratio)))
+    take_n = min(take_n, len(idx))
+    keep_idx = hashed.sort_values().head(take_n).index
+    selected.loc[keep_idx] = True
+    return selected
+
+
 def make_supervision_frame(df: pd.DataFrame, supervision_variant: str) -> pd.DataFrame:
     tmp = df.copy()
     if supervision_variant == "family_aware_mix":
-        use_short_reasoning = (
-            (
-                tmp["prompt_family"].isin({"matrix_reasoning", "sequence"})
-                & tmp["answer_type"].isin({"numeric", "binary"})
-            )
-            |
-            (
-                tmp["prompt_family"].eq("cipher_decrypt")
-                & tmp["answer_type"].isin({"short_text", "multi_token_text"})
-            )
-            |
-            (
-                tmp["prompt_family"].eq("open_template")
-                & tmp["answer_type"].isin({"short_text", "multi_token_text"})
-            )
+        text_mask = (
+            tmp["prompt_family"].isin({"cipher_decrypt", "open_template"})
+            & tmp["answer_type"].isin({"short_text", "multi_token_text"})
         )
-        ratio = float(np.clip(cfg.family_aware_short_reasoning_ratio, 0.0, 1.0))
-        hashed_ratio_gate = (
-            tmp["id"]
-            .astype(str)
-            .map(lambda x: int(hashlib.md5(x.encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF)
-            .lt(ratio)
+        numeric_mask = (
+            tmp["prompt_family"].isin({"matrix_reasoning", "sequence"})
+            & tmp["answer_type"].isin({"numeric", "binary"})
         )
-        use_short_reasoning = use_short_reasoning & hashed_ratio_gate
+
+        base_ratio = float(np.clip(cfg.family_aware_short_reasoning_ratio, 0.0, 1.0))
+        text_ratio = max(base_ratio, float(np.clip(cfg.family_aware_min_text_reasoning_ratio, 0.0, 1.0)))
+        text_reasoning_mask = _deterministic_ratio_mask(text_mask, tmp["id"], text_ratio)
+
+        if cfg.family_aware_enable_numeric_reasoning:
+            numeric_ratio = min(
+                base_ratio,
+                float(np.clip(cfg.family_aware_max_numeric_reasoning_ratio, 0.0, 1.0)),
+            )
+            numeric_reasoning_mask = _deterministic_ratio_mask(numeric_mask, tmp["id"], numeric_ratio)
+        else:
+            numeric_reasoning_mask = pd.Series(False, index=tmp.index)
+
+        use_short_reasoning = text_reasoning_mask | numeric_reasoning_mask
 
         tmp["supervision_variant"] = np.where(
             use_short_reasoning,
@@ -2285,7 +2319,7 @@ def predict_one_row_official(
     raw = generate_answer_text(
         model,
         eval_prompt,
-        max_new_tokens=cfg.official_max_new_tokens if max_new_tokens is None else max_new_tokens,
+        max_new_tokens=cfg.local_eval_max_new_tokens if max_new_tokens is None else max_new_tokens,
         temperature=cfg.official_temperature,
         top_p=cfg.official_top_p,
     ).strip()
