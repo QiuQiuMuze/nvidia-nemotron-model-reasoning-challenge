@@ -107,6 +107,8 @@ class CFG:
     round_submission_dir: str = "/kaggle/working/outputs"
     save_stage1_round_submission: bool = True
     save_stage2_round_submissions: bool = True
+    # 每轮结束后可回载该轮 local-accuracy 最优 checkpoint，降低“末步漂移”。
+    stage2_reload_best_candidate_each_round: bool = True
 
     # ===== candidate / final selection =====
     topk_candidate_keep: int = 5
@@ -168,12 +170,14 @@ class CFG:
     stage1_epochs: float = 0.9
     stage2_epochs: float = 2.0
     stage2_rounds: int = 3
-    # 如需减负可开启早轮 fast eval；默认关闭以避免 last_pred_df 噪声放大重加权偏差。
-    stage2_use_fast_eval_before_final: bool = True
+    # Stage2 每轮都会基于评估结果做 hard mining / replay 重加权。
+    # 默认关闭 fast-eval 近似，减少“噪声评估 -> 错误重加权 -> 分数回落”链式放大。
+    stage2_use_fast_eval_before_final: bool = False
     stage1_max_prompt_chars: int = 1800
     # 长上下文下适度降低学习率，减少训练振荡。
     stage1_lr: float = 1.2e-4
-    stage2_lr: float = 5e-5
+    # 轻微下调 Stage2 学习率，减少多轮重加权下的振荡。
+    stage2_lr: float = 4.5e-5
 
     # ===== optional leaderboard tricks =====
     enable_external_mixture: bool = True
@@ -183,9 +187,10 @@ class CFG:
     run_supervision_ablation: bool = False
     # 兼容保留：若未配置 stage1/stage2 独立监督形式，则使用该默认值。
     primary_supervision_variant: str = "answer_only"
-    # Stage1 可以更激进以拉升 short_text；Stage2 回到 answer_only 防止语义漂移放大。
+    # Stage1 可以更激进以拉升 short_text；Stage2 默认保持 family_aware_mix，
+    # 避免监督目标突变导致“loss 下降但评测分数回落”。
     stage1_primary_supervision_variant: str = "family_aware_mix"
-    stage2_primary_supervision_variant: str = "answer_only"
+    stage2_primary_supervision_variant: str = "family_aware_mix"
     # 训练提示词风格：official_single_prompt 更贴近评测；hybrid 兼顾稳定性。
     training_prompt_style: str = "hybrid"  # "chat_template" | "official_single_prompt" | "hybrid"
     training_official_prompt_ratio: float = 0.60
@@ -226,14 +231,15 @@ class CFG:
     stage2_refresh_replay_family_error_threshold: float = 0.40
     fixed_sanity_rows: int = 64
     stage1_family_frequency_quantile: float = 0.20
-    hard_mining_family_boost: float = 0.50
+    # 适度降低 hard-mining 强度，优先稳住泛化后再追击难例。
+    hard_mining_family_boost: float = 0.35
     hard_mining_template_group_boost: float = 0.20
     hard_mining_answer_type_boost: float = 0.15
     hard_mining_bucket_boost: float = 0.15
-    hard_mining_sample_boost: float = 0.20
+    hard_mining_sample_boost: float = 0.12
     use_log_replay_boost: bool = True
     sample_weight_clip_min: float = 0.35
-    sample_weight_clip_max: float = 2.80
+    sample_weight_clip_max: float = 2.20
     sample_weight_temperature: float = 0.80
     stage1_low_freq_sample_ratio: float = 0.30
     # family_aware_mix 的基础 short_reasoning 比例（仅作用于命中的族群/题型）。
@@ -3523,6 +3529,7 @@ def train_stage2_with_reweight(
     refresh_assets_fn: Optional[Callable[[torch.nn.Module, int], Optional[Dict[str, Any]]]] = None,
     round_callback: Optional[TrainerCallback] = None,
 ) -> Tuple[torch.nn.Module, pd.DataFrame, Dict[str, int]]:
+    global collator
     current_weights = initial_weights
     last_pred_df = pd.DataFrame()
     replay_buffer = dict(replay_buffer or {})
@@ -3543,6 +3550,29 @@ def train_stage2_with_reweight(
             callbacks=[round_callback] if round_callback is not None else [],
         )
         trainer.train()
+
+        if cfg.stage2_reload_best_candidate_each_round and (not cfg.smoke_test_mode):
+            round_best_candidate = pick_best_candidate_record(
+                cfg.stage2_topk_manifest_path,
+                round_idx=round_idx + 1,
+            )
+            if round_best_candidate is not None:
+                model = reload_saved_adapter_into_current_model(
+                    model=model,
+                    adapter_dir=round_best_candidate["candidate_dir"],
+                )
+                collator = DataCollatorForSeq2Seq(
+                    tokenizer=tokenizer,
+                    model=model,
+                    padding=True,
+                    pad_to_multiple_of=8,
+                    return_tensors="pt",
+                )
+                print(
+                    "[stage2 round best] "
+                    f"round={round_idx + 1} step={int(round_best_candidate['step'])} "
+                    f"acc={float(round_best_candidate['local_accuracy']):.6f} reloaded"
+                )
 
         use_fast_round_eval = (
             cfg.stage2_use_fast_eval_before_final
@@ -3993,7 +4023,7 @@ stage2_weights = compute_sample_weights(
 print("stage2 weight summary after hard profile + replay bootstrap:", np.quantile(stage2_weights, [0, 0.25, 0.5, 0.75, 1]))
 
 stage2_local_callback = LocalAccuracyCallback(
-    eval_df=fast_eval_df,
+    eval_df=serious_eval_df if (not cfg.stage2_use_fast_eval_before_final) else fast_eval_df,
     save_path=str(Path(cfg.work_dir) / "stage2_local_accuracy_history.csv"),
     extractor_fn=metric_extract_prediction,
     save_top_k=cfg.topk_candidate_keep,
@@ -4441,6 +4471,7 @@ def load_topk_candidate_manifest() -> pd.DataFrame:
     if not stage2_df.empty:
         stage2_df = stage2_df.copy()
         stage2_df["candidate_stage"] = "stage2"
+    if not stage2_df.empty:
         return stage2_df.reset_index(drop=True)
 
     stage1_df = load_candidate_manifest(cfg.stage1_topk_manifest_path)
