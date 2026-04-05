@@ -123,6 +123,8 @@ class CFG:
     topk_min_global_step: int = 100
     final_rerank_run_submission_style: bool = True
     final_rerank_submission_rows: int = 128
+    # 最终 rerank 默认合并 stage1 + stage2 top-k，避免 stage2 轻微退化时被单阶段候选池锁死。
+    final_rerank_merge_stage1_candidates: bool = True
     reload_stage1_best_candidate: bool = True
 
     # ===== reproducibility =====
@@ -168,8 +170,9 @@ class CFG:
     stage1_epochs: float = 0.9
     stage2_epochs: float = 2.0
     stage2_rounds: int = 3
-    # 如需减负可开启早轮 fast eval；默认关闭以避免 last_pred_df 噪声放大重加权偏差。
-    stage2_use_fast_eval_before_final: bool = True
+    # Stage2 每轮都会基于评估结果做 hard mining / replay 重加权。
+    # 默认关闭 fast-eval 近似，减少“噪声评估 -> 错误重加权 -> 分数回落”链式放大。
+    stage2_use_fast_eval_before_final: bool = False
     stage1_max_prompt_chars: int = 1800
     # 长上下文下适度降低学习率，减少训练振荡。
     stage1_lr: float = 1.2e-4
@@ -183,9 +186,10 @@ class CFG:
     run_supervision_ablation: bool = False
     # 兼容保留：若未配置 stage1/stage2 独立监督形式，则使用该默认值。
     primary_supervision_variant: str = "answer_only"
-    # Stage1 可以更激进以拉升 short_text；Stage2 回到 answer_only 防止语义漂移放大。
+    # Stage1 可以更激进以拉升 short_text；Stage2 默认保持 family_aware_mix，
+    # 避免监督目标突变导致“loss 下降但评测分数回落”。
     stage1_primary_supervision_variant: str = "family_aware_mix"
-    stage2_primary_supervision_variant: str = "answer_only"
+    stage2_primary_supervision_variant: str = "family_aware_mix"
     # 训练提示词风格：official_single_prompt 更贴近评测；hybrid 兼顾稳定性。
     training_prompt_style: str = "hybrid"  # "chat_template" | "official_single_prompt" | "hybrid"
     training_official_prompt_ratio: float = 0.60
@@ -4438,15 +4442,24 @@ def summarize_multi_seed_result(multi_seed_df: pd.DataFrame) -> Dict[str, float]
 
 def load_topk_candidate_manifest() -> pd.DataFrame:
     stage2_df = load_candidate_manifest(cfg.stage2_topk_manifest_path)
+    stage1_df = load_candidate_manifest(cfg.stage1_topk_manifest_path)
     if not stage2_df.empty:
         stage2_df = stage2_df.copy()
         stage2_df["candidate_stage"] = "stage2"
-        return stage2_df.reset_index(drop=True)
-
-    stage1_df = load_candidate_manifest(cfg.stage1_topk_manifest_path)
     if not stage1_df.empty:
         stage1_df = stage1_df.copy()
         stage1_df["candidate_stage"] = "stage1"
+
+    if cfg.final_rerank_merge_stage1_candidates:
+        merged = pd.concat([stage2_df, stage1_df], ignore_index=True)
+        if merged.empty:
+            return pd.DataFrame(columns=["round_idx", "step", "local_accuracy", "candidate_dir", "candidate_stage"])
+        merged = merged.drop_duplicates(subset=["candidate_dir"]).reset_index(drop=True)
+        return merged.sort_values(["local_accuracy", "round_idx", "step"], ascending=[False, False, False]).reset_index(drop=True)
+
+    if not stage2_df.empty:
+        return stage2_df.reset_index(drop=True)
+    if not stage1_df.empty:
         return stage1_df.reset_index(drop=True)
 
     return pd.DataFrame(columns=["round_idx", "step", "local_accuracy", "candidate_dir", "candidate_stage"])
