@@ -152,9 +152,10 @@ class CFG:
 
     # ===== split / eval =====
     valid_size: float = 0.12
-    fast_eval_examples: int = 128
+    fast_eval_examples: int = 192
     serious_eval_examples: int = 384
     serious_eval_seeds: Tuple[int, ...] = (11, 23, 47)
+    stage1_model_select_examples: int = 256
     # 官方文案仅说明“relative numerical tolerance”，未公开具体数值；
     # 这里采用更严格容差，避免本地分数乐观偏高。
     numeric_rel_tol: float = 1e-4
@@ -163,15 +164,15 @@ class CFG:
     official_metric_backend_path: Optional[str] = None
 
     # ===== curriculum =====
-    stage1_epochs: float = 0.9
+    stage1_epochs: float = 1.2
     # 保守版 Stage2：先降总训练强度，避免二次训练过拟合 / 遗忘。
     stage2_epochs: float = 1.2
     stage2_rounds: int = 2
     # 如需减负可开启早轮 fast eval；默认关闭以避免 last_pred_df 噪声放大重加权偏差。
     stage2_use_fast_eval_before_final: bool = False
-    stage1_max_prompt_chars: int = 1800
+    stage1_max_prompt_chars: int = 2400
     # 长上下文下适度降低学习率，减少训练振荡。
-    stage1_lr: float = 1.2e-4
+    stage1_lr: float = 9e-5
     stage2_lr: float = 5e-5
 
     # ===== optional leaderboard tricks =====
@@ -180,10 +181,10 @@ class CFG:
     enable_family_reweight: bool = True
     enable_length_bucket_bonus: bool = True
     run_supervision_ablation: bool = False
-    primary_supervision_variant: str = "answer_only"
+    primary_supervision_variant: str = "family_aware_mix"
     # 训练提示词风格：official_single_prompt 更贴近评测；hybrid 兼顾稳定性。
     training_prompt_style: str = "hybrid"  # "chat_template" | "official_single_prompt" | "hybrid"
-    training_official_prompt_ratio: float = 0.60
+    training_official_prompt_ratio: float = 0.80
     supervision_ablation_variants: Tuple[str, ...] = ("answer_only", "short_reasoning", "family_aware_mix")
     supervision_ablation_stage1_epochs: float = 0.20
     supervision_ablation_stage2_epochs: float = 0.20
@@ -220,7 +221,7 @@ class CFG:
     stage2_refresh_min_weak_family_gain: float = 0.005
     stage2_refresh_replay_family_error_threshold: float = 0.40
     fixed_sanity_rows: int = 64
-    stage1_family_frequency_quantile: float = 0.20
+    stage1_family_frequency_quantile: float = 0.10
     hard_mining_family_boost: float = 0.50
     hard_mining_template_group_boost: float = 0.20
     hard_mining_answer_type_boost: float = 0.20
@@ -230,8 +231,8 @@ class CFG:
     use_log_replay_boost: bool = False
     sample_weight_clip_min: float = 0.35
     sample_weight_clip_max: float = 1.90
-    sample_weight_temperature: float = 0.80
-    stage1_low_freq_sample_ratio: float = 0.30
+    sample_weight_temperature: float = 0.95
+    stage1_low_freq_sample_ratio: float = 0.40
     family_aware_short_reasoning_ratio: float = 0.35
     replay_probe_rows: int = 128
     short_text_weight_boost: float = 1.25
@@ -2126,11 +2127,16 @@ def build_seeded_family_balanced_subset(df: pd.DataFrame, max_rows: int, seed: i
 
 fast_eval_rows = cfg.smoke_fast_eval_rows if cfg.smoke_test_mode else cfg.fast_eval_examples
 serious_eval_rows = cfg.smoke_serious_eval_rows if cfg.smoke_test_mode else cfg.serious_eval_examples
+stage1_model_select_rows = min(
+    serious_eval_rows,
+    (cfg.smoke_serious_eval_rows if cfg.smoke_test_mode else cfg.stage1_model_select_examples),
+)
 fixed_sanity_rows = min(cfg.fixed_sanity_rows, 8) if cfg.smoke_test_mode else cfg.fixed_sanity_rows
 replay_probe_rows = min(cfg.replay_probe_rows, 8) if cfg.smoke_test_mode else cfg.replay_probe_rows
 
 fast_eval_df = stratified_valid_subset(valid_fold, fast_eval_rows)
 serious_eval_df = build_seeded_family_balanced_subset(valid_fold, serious_eval_rows, seed=cfg.seed)
+stage1_model_select_df = build_seeded_family_balanced_subset(valid_fold, stage1_model_select_rows, seed=cfg.seed)
 serious_eval_views = {
     seed: build_seeded_family_balanced_subset(valid_fold, serious_eval_rows, seed=seed)
     for seed in cfg.serious_eval_seeds
@@ -2140,6 +2146,7 @@ train_replay_probe_df = build_fixed_sanity_subset(train_fold, replay_probe_rows)
 
 print("fast eval subset:", fast_eval_df.shape)
 print("serious eval subset:", serious_eval_df.shape)
+print("stage1 model-select subset:", stage1_model_select_df.shape)
 print("serious eval view seeds:", {seed: df.shape for seed, df in serious_eval_views.items()})
 print("fixed sanity subset:", fixed_sanity_df.shape)
 print("train replay probe subset:", train_replay_probe_df.shape)
@@ -3736,7 +3743,7 @@ if not cfg.smoke_test_mode:
 
 # %%
 stage1_local_callback = LocalAccuracyCallback(
-    eval_df=fast_eval_df,
+    eval_df=stage1_model_select_df,
     save_path=str(Path(cfg.work_dir) / "stage1_local_accuracy_history.csv"),
     extractor_fn=metric_extract_prediction,
     save_top_k=cfg.topk_candidate_keep,
