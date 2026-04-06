@@ -120,7 +120,8 @@ class CFG:
     topk_min_global_step: int = 100
     final_rerank_run_submission_style: bool = True
     final_rerank_submission_rows: int = 128
-    reload_stage1_best_candidate: bool = False
+    # 默认从 stage1 最优 checkpoint 继续做 stage2，降低“stage1 末尾漂移”带入风险。
+    reload_stage1_best_candidate: bool = True
 
     # ===== reproducibility =====
     seed: int = 3407
@@ -163,14 +164,15 @@ class CFG:
 
     # ===== curriculum =====
     stage1_epochs: float = 0.9
-    stage2_epochs: float = 2.8
-    stage2_rounds: int = 4
+    # 保守版 Stage2：先降总训练强度，避免二次训练过拟合 / 遗忘。
+    stage2_epochs: float = 1.2
+    stage2_rounds: int = 2
     # 如需减负可开启早轮 fast eval；默认关闭以避免 last_pred_df 噪声放大重加权偏差。
     stage2_use_fast_eval_before_final: bool = False
     stage1_max_prompt_chars: int = 1800
     # 长上下文下适度降低学习率，减少训练振荡。
     stage1_lr: float = 1.2e-4
-    stage2_lr: float = 7e-5
+    stage2_lr: float = 5e-5
 
     # ===== optional leaderboard tricks =====
     enable_external_mixture: bool = True
@@ -223,10 +225,11 @@ class CFG:
     hard_mining_template_group_boost: float = 0.20
     hard_mining_answer_type_boost: float = 0.20
     hard_mining_bucket_boost: float = 0.15
-    hard_mining_sample_boost: float = 0.35
-    use_log_replay_boost: bool = True
+    # 弱化 sample-level replay 放大效应，减轻“少数难例被过采样”。
+    hard_mining_sample_boost: float = 0.12
+    use_log_replay_boost: bool = False
     sample_weight_clip_min: float = 0.35
-    sample_weight_clip_max: float = 2.80
+    sample_weight_clip_max: float = 1.90
     sample_weight_temperature: float = 0.80
     stage1_low_freq_sample_ratio: float = 0.30
     family_aware_short_reasoning_ratio: float = 0.35
