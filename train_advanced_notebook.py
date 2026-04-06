@@ -108,7 +108,8 @@ class CFG:
     save_stage1_round_submission: bool = True
     save_stage2_round_submissions: bool = True
     # 每轮结束后可回载该轮 local-accuracy 最优 checkpoint，降低“末步漂移”。
-    stage2_reload_best_candidate_each_round: bool = True
+    # 默认关闭：每轮强制回滚到“该轮局部最优”容易放大评估噪声，导致 Stage2 震荡。
+    stage2_reload_best_candidate_each_round: bool = False
 
     # ===== candidate / final selection =====
     topk_candidate_keep: int = 5
@@ -125,7 +126,8 @@ class CFG:
     topk_min_global_step: int = 100
     final_rerank_run_submission_style: bool = True
     final_rerank_submission_rows: int = 128
-    reload_stage1_best_candidate: bool = True
+    # 默认关闭：避免把 Stage1 在小验证集上的过拟合偏差带入 Stage2 起点。
+    reload_stage1_best_candidate: bool = False
 
     # ===== reproducibility =====
     seed: int = 3407
