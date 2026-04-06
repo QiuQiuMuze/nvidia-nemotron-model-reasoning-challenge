@@ -3940,6 +3940,18 @@ stage2_local_callback = LocalAccuracyCallback(
     manifest_path=None if cfg.smoke_test_mode else cfg.stage2_topk_manifest_path,
 )
 
+
+# Cell 20.5
+def export_current_model_as_round_submission(
+    model: torch.nn.Module,
+    round_idx: int,
+) -> Path:
+    return export_model_as_round_submission(
+        model=model,
+        round_idx=round_idx,
+    )
+
+
 # %% [markdown]
 # ## Cell 21 — Stage 2 训练（多轮重加权，而非轮间重建数据资产）
 
@@ -4004,6 +4016,7 @@ if (not cfg.smoke_test_mode) and cfg.save_final_snapshot_before_post_eval:
         tag="after_stage2_train",
     )
     cleanup_cuda()
+
 
 # Cell 21.5
 if (not cfg.smoke_test_mode) and cfg.save_final_snapshot_before_post_eval:
