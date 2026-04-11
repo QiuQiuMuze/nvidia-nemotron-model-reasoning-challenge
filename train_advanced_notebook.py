@@ -91,6 +91,10 @@ class CFG:
     official_max_model_len: int = 8192
     official_eval_mode: bool = True
     warmup_steps_override: Optional[int] = None
+    # 训练过程中的 local callback 默认不走 official 7680-token 评估，
+    # 否则在首轮 eval 会极慢，看起来像“卡住”。
+    local_callback_use_official_eval_mode: bool = False
+    local_callback_max_new_tokens_grid: Tuple[int, ...] = (48, 72)
 
     # ===== paths =====
     competition_path: str = "/kaggle/input/competitions/nvidia-nemotron-model-reasoning-challenge"
@@ -2986,6 +2990,8 @@ class LocalAccuracyCallback(TrainerCallback):
         metric_name: str = "local_accuracy",
         min_global_step: int = 0,
         manifest_path: Optional[str] = None,
+        use_official_eval_mode: Optional[bool] = None,
+        max_new_tokens_grid: Optional[Sequence[int]] = None,
     ):
         self.eval_df = eval_df
         self.save_path = save_path
@@ -2998,6 +3004,11 @@ class LocalAccuracyCallback(TrainerCallback):
         self.metric_name = metric_name
         self.min_global_step = int(min_global_step)
         self.manifest_path = Path(manifest_path) if manifest_path is not None else None
+        self.use_official_eval_mode = cfg.local_callback_use_official_eval_mode if use_official_eval_mode is None else bool(use_official_eval_mode)
+        if max_new_tokens_grid is None:
+            self.max_new_tokens_grid = tuple(cfg.local_callback_max_new_tokens_grid)
+        else:
+            self.max_new_tokens_grid = tuple(int(x) for x in max_new_tokens_grid)
 
         self.topk_candidates: List[Dict[str, Any]] = []
         self.current_round_idx: int = 0
@@ -3092,7 +3103,13 @@ class LocalAccuracyCallback(TrainerCallback):
         )
 
     def on_evaluate(self, args, state, control, model=None, **kwargs):
-        acc, pred_df = evaluate_accuracy(model, self.eval_df, extractor_fn=self.extractor_fn)
+        acc, pred_df = evaluate_accuracy(
+            model,
+            self.eval_df,
+            extractor_fn=self.extractor_fn,
+            max_new_tokens_grid=self.max_new_tokens_grid,
+            use_official_eval_mode=self.use_official_eval_mode,
+        )
         record = {"step": int(state.global_step), "local_accuracy": float(acc)}
         self.history.append(record)
 
@@ -3752,6 +3769,8 @@ stage1_local_callback = LocalAccuracyCallback(
     metric_name="stage1_local_accuracy",
     min_global_step=cfg.topk_min_global_step,
     manifest_path=None if cfg.smoke_test_mode else cfg.stage1_topk_manifest_path,
+    use_official_eval_mode=cfg.local_callback_use_official_eval_mode,
+    max_new_tokens_grid=cfg.local_callback_max_new_tokens_grid,
 )
 
 if len(stage1_ds) > 0:
@@ -3948,6 +3967,8 @@ stage2_local_callback = LocalAccuracyCallback(
     metric_name="stage2_local_accuracy",
     min_global_step=cfg.topk_min_global_step,
     manifest_path=None if cfg.smoke_test_mode else cfg.stage2_topk_manifest_path,
+    use_official_eval_mode=cfg.local_callback_use_official_eval_mode,
+    max_new_tokens_grid=cfg.local_callback_max_new_tokens_grid,
 )
 
 
